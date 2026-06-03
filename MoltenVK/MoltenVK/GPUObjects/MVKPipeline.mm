@@ -1754,6 +1754,7 @@ bool MVKGraphicsPipeline::addVertexInputToPipeline(T* inputDesc,
     }
 
 	// Vertex attributes
+	std::vector<uint32_t> boundLocations;
 	uint32_t vaCnt = pVI->vertexAttributeDescriptionCount;
 	for (uint32_t i = 0; i < vaCnt; i++) {
 		const VkVertexInputAttributeDescription* pVKVA = &pVI->pVertexAttributeDescriptions[i];
@@ -1811,7 +1812,28 @@ bool MVKGraphicsPipeline::addVertexInputToPipeline(T* inputDesc,
 			vaDesc.format = mtlFormat;
 			vaDesc.bufferIndex = (decltype(vaDesc.bufferIndex))getMetalBufferIndexForVertexAttributeBinding(vaBinding);
 			vaDesc.offset = vaOffset;
+
+			boundLocations.push_back(pVKVA->location);
 		}
+	}
+
+	bool needBufferZeroStride = false;
+	for (auto& ctxSI : shaderConfig.shaderInputs) {
+		if (ctxSI.outIsUsedByShader && ctxSI.shaderVar.builtin == spv::BuiltInMax && std::find(boundLocations.begin(), boundLocations.end(), ctxSI.shaderVar.location) == boundLocations.end()) {
+			reportWarning(VK_ERROR_VALIDATION_FAILED, "Shader uses unbound vertex attribute %u.", ctxSI.shaderVar.location);
+			auto vaDesc = inputDesc.attributes[ctxSI.shaderVar.location];
+			vaDesc.format = (decltype(vaDesc.format))getPixelFormats()->getMTLVertexFormat(VK_FORMAT_R8G8B8A8_UNORM);
+			vaDesc.bufferIndex = maxBinding != -1 ? (decltype(vaDesc.bufferIndex))getMetalBufferIndexForVertexAttributeBinding(maxBinding) : 0;
+			vaDesc.offset = 0;
+			needBufferZeroStride = maxBinding == -1;
+		}
+	}
+
+	if (needBufferZeroStride) {
+		auto vbDesc = inputDesc.layouts[0];
+		vbDesc.stride = 1;
+		vbDesc.stepFunction = (decltype(vbDesc.stepFunction))MTLStepFunctionConstant;
+		vbDesc.stepRate = 0;
 	}
 
 	// Run through the vertex bindings. Add a new Metal vertex layout for each translated binding,

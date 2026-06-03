@@ -386,6 +386,26 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
 			ctxSI.outIsUsedByShader = pMSLCompiler->is_msl_shader_input_used(ctxSI.shaderVar.location);
 		}
 	}
+	if (shaderConfig.options.entryPointStage == spv::ExecutionModelVertex) {
+		for (uint32_t i = 0; i < 30; i++) {
+			if (pMSLCompiler->is_msl_shader_input_used(i)) {
+				bool found = false;
+				for (auto& ctxSI : shaderConfig.shaderInputs) {
+					if (ctxSI.shaderVar.location == i) {
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					MSLShaderInput si;
+					si.shaderVar.location = i;
+					si.binding = 0;
+					si.outIsUsedByShader = true;
+					shaderConfig.shaderInputs.push_back(si);
+				}
+			}
+		}
+	}
 	for (auto& ctxSO : shaderConfig.shaderOutputs) {
 		if (ctxSO.shaderVar.builtin != spv::BuiltInMax) {
 			ctxSO.outIsUsedByShader = pMSLCompiler->has_active_builtin(ctxSO.shaderVar.builtin, spv::StorageClassOutput);
