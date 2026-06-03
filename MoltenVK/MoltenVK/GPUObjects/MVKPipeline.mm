@@ -2705,6 +2705,13 @@ VkResult MVKPipelineCache::writeDataImpl(size_t* pDataSize, void* pData) {
 
 		if ( !pDataSize ) { return VK_SUCCESS; }
 
+		if (_dataSize == 0) {
+			mvk::countbuf cb;
+			ostream outStream(&cb);
+			writeData(outStream, true);
+			_dataSize = cb.buffSize;
+		}
+
 		if (pData) {
 			if (*pDataSize >= _dataSize) {
 				mvk::membuf mb((char*)pData, _dataSize);
@@ -2717,12 +2724,6 @@ VkResult MVKPipelineCache::writeDataImpl(size_t* pDataSize, void* pData) {
 				return VK_INCOMPLETE;
 			}
 		} else {
-			if (_dataSize == 0) {
-				mvk::countbuf cb;
-				ostream outStream(&cb);
-				writeData(outStream, true);
-				_dataSize = cb.buffSize;
-			}
 			*pDataSize = _dataSize;
 			return VK_SUCCESS;
 		}
