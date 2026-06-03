@@ -1184,6 +1184,12 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 		return nil;
 	}
 
+	SPIRVShaderOutputs fragOutputs;
+	if (pFragmentSS && !getShaderOutputs(_fragmentModule->getSPIRV(), spv::ExecutionModelFragment, pFragmentSS->pName, fragOutputs, errorLog) ) {
+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get fragment outputs: %s", errorLog.c_str()));
+		return nil;
+	}
+
 	// Add shader stages. Compile vertex shader before others just in case conversion changes anything...like rasterizaion disable.
 	if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pVertexSS, pVertexFB, pFragmentSS)) { return nil; }
 
@@ -1195,7 +1201,7 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pFragmentSS, pFragmentFB)) { return nil; }
 
 	// Output
-	addFragmentOutputToPipeline(plDesc, pCreateInfo);
+	addFragmentOutputToPipeline(plDesc, pCreateInfo, fragOutputs);
 
 	// Metal does not allow the name of the pipeline to be changed after it has been created,
 	// and we need to create the Metal pipeline immediately to provide error feedback to app.
@@ -1429,7 +1435,7 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLTessRasterStageDescripto
 	addTessellationToPipeline(plDesc, reflectData, pCreateInfo->pTessellationState);
 
 	// Output
-	addFragmentOutputToPipeline(plDesc, pCreateInfo);
+	addFragmentOutputToPipeline(plDesc, pCreateInfo, teOutputs);
 
 	return plDesc;
 }
@@ -1817,21 +1823,35 @@ bool MVKGraphicsPipeline::addVertexInputToPipeline(T* inputDesc,
 		}
 	}
 
-	bool needBufferZeroStride = false;
-	for (auto& ctxSI : shaderConfig.shaderInputs) {
-		if (ctxSI.outIsUsedByShader && ctxSI.shaderVar.builtin == spv::BuiltInMax && std::find(boundLocations.begin(), boundLocations.end(), ctxSI.shaderVar.location) == boundLocations.end()) {
-			reportWarning(VK_ERROR_VALIDATION_FAILED, "Shader uses unbound vertex attribute %u.", ctxSI.shaderVar.location);
-			auto vaDesc = inputDesc.attributes[ctxSI.shaderVar.location];
-			vaDesc.format = (decltype(vaDesc.format))getPixelFormats()->getMTLVertexFormat(VK_FORMAT_R8G8B8A8_UNORM);
-			vaDesc.bufferIndex = maxBinding != -1 ? (decltype(vaDesc.bufferIndex))getMetalBufferIndexForVertexAttributeBinding(maxBinding) : 0;
-			vaDesc.offset = 0;
-			needBufferZeroStride = maxBinding == -1;
+	// Metal requires all vertex attributes used by the shader to be defined in the vertex descriptor.
+	// If the app hasn't provided one, add a dummy one.
+	uint32_t dummyBufferIndex = 0;
+	bool foundUsedBuffer = false;
+	for (uint32_t i = 0; i < kMVKMaxBufferCount; i++) {
+		if (_mtlVertexBuffers.get(i)) {
+			dummyBufferIndex = i;
+			foundUsedBuffer = true;
+			break;
 		}
 	}
 
-	if (needBufferZeroStride) {
-		auto vbDesc = inputDesc.layouts[0];
-		vbDesc.stride = 1;
+	for (auto& ctxSI : shaderConfig.shaderInputs) {
+		if (ctxSI.outIsUsedByShader && ctxSI.shaderVar.builtin == spv::BuiltInMax && std::find(boundLocations.begin(), boundLocations.end(), ctxSI.shaderVar.location) == boundLocations.end()) {
+			if (ctxSI.shaderVar.location < 31) {
+				auto vaDesc = inputDesc.attributes[ctxSI.shaderVar.location];
+				if ((uint32_t)vaDesc.format == 0) {
+					vaDesc.format = (decltype(vaDesc.format))MTLVertexFormatUChar4;
+					vaDesc.bufferIndex = dummyBufferIndex;
+					vaDesc.offset = 0;
+				}
+			}
+		}
+	}
+
+	// If we had to use a buffer that wasn't already configured, make it safe.
+	if (!foundUsedBuffer) {
+		auto vbDesc = inputDesc.layouts[dummyBufferIndex];
+		vbDesc.stride = 1; // Metal requires a non-zero stride
 		vbDesc.stepFunction = (decltype(vbDesc.stepFunction))MTLStepFunctionConstant;
 		vbDesc.stepRate = 0;
 	}
@@ -1942,7 +1962,8 @@ void MVKGraphicsPipeline::addTessellationToPipeline(MTLRenderPipelineDescriptor*
 }
 
 void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescriptor* plDesc,
-													  const VkGraphicsPipelineCreateInfo* pCreateInfo) {
+													  const VkGraphicsPipelineCreateInfo* pCreateInfo,
+													  SPIRVShaderOutputs& fragOutputs) {
 	// Topology
 	if (pCreateInfo->pInputAssemblyState)
 		plDesc.inputPrimitiveTopology = getPrimitiveTopologyClass();
@@ -1959,6 +1980,37 @@ void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescripto
 
 			VkFormat attachFmt = pRendInfo->pColorAttachmentFormats[caIdx];
 			MTLPixelFormat mtlPixFmt = getPixelFormats()->getMTLPixelFormat(attachFmt);
+
+			// Check if the shader output type mismatches the attachment format.
+			// e.g., Detroit: Become Human requests R32Uint but outputs a float4.
+			// Metal will assert if they do not match exactly.
+			for (const auto& so : fragOutputs) {
+				if (so.location == caLoc) {
+					MVKFormatType mvkFmtType = getPixelFormats()->getFormatType(mtlPixFmt);
+					bool isFloatFmt = (mvkFmtType == kMVKFormatColorHalf || mvkFmtType == kMVKFormatColorFloat);
+					bool isUIntFmt = (mvkFmtType == kMVKFormatColorUInt8 || mvkFmtType == kMVKFormatColorUInt16 || mvkFmtType == kMVKFormatColorUInt32);
+
+					if (so.baseType == SPIRV_CROSS_NAMESPACE::SPIRType::Float && isUIntFmt) {
+						// Shader outputs float, but attachment is UInt. Substitute to a float format.
+						switch (getPixelFormats()->getBytesPerBlock(attachFmt)) {
+							case 4: mtlPixFmt = MTLPixelFormatR32Float; break;
+							case 8: mtlPixFmt = MTLPixelFormatRG32Float; break;
+							case 16: mtlPixFmt = MTLPixelFormatRGBA32Float; break;
+						}
+						reportWarning(VK_ERROR_VALIDATION_FAILED, "Shader fragment output at location %u is Float, but color attachment format is UInt. Substituted MTLPixelFormat to %u to prevent Metal crash.", caLoc, (uint32_t)mtlPixFmt);
+					} else if (so.baseType == SPIRV_CROSS_NAMESPACE::SPIRType::UInt && isFloatFmt) {
+						// Shader outputs UInt, but attachment is Float. Substitute to a UInt format.
+						switch (getPixelFormats()->getBytesPerBlock(attachFmt)) {
+							case 4: mtlPixFmt = MTLPixelFormatR32Uint; break;
+							case 8: mtlPixFmt = MTLPixelFormatRG32Uint; break;
+							case 16: mtlPixFmt = MTLPixelFormatRGBA32Uint; break;
+						}
+						reportWarning(VK_ERROR_VALIDATION_FAILED, "Shader fragment output at location %u is UInt, but color attachment format is Float. Substituted MTLPixelFormat to %u to prevent Metal crash.", caLoc, (uint32_t)mtlPixFmt);
+					}
+					break;
+				}
+			}
+
 			bool supportsBlend = getPixelFormats()->getCapabilities(mtlPixFmt) & kMVKMTLFmtCapsBlend;
 			MTLRenderPipelineColorAttachmentDescriptor* colorDesc = plDesc.colorAttachments[caLoc];
             colorDesc.pixelFormat = mtlPixFmt;

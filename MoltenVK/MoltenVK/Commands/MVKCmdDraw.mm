@@ -209,7 +209,8 @@ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
         tempDrawIDBuff = cmdEncoder->getTempMTLBuffer(sizeof(uint32_t));
 
         // We don't currently support non-indirect multi-draw commands, so just 0.
-        memset([tempDrawIDBuff->_mtlBuffer contents], 0, sizeof(uint32_t));
+		uint32_t* pDrawID = (uint32_t*)((char*)[tempDrawIDBuff->_mtlBuffer contents] + tempDrawIDBuff->_offset);
+		*pDrawID = 0;
     }
     for (uint32_t s : stages) {
         auto stage = MVKGraphicsStage(s);
@@ -492,7 +493,8 @@ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
         tempDrawIDBuff = cmdEncoder->getTempMTLBuffer(sizeof(uint32_t));
 
         // We don't currently support non-indirect multi-draw commands, so just 0.
-        memset([tempDrawIDBuff->_mtlBuffer contents], 0, sizeof(uint32_t));
+		uint32_t* pDrawID = (uint32_t*)((char*)[tempDrawIDBuff->_mtlBuffer contents] + tempDrawIDBuff->_offset);
+		*pDrawID = 0;
     }
     for (uint32_t s : stages) {
         auto stage = MVKGraphicsStage(s);

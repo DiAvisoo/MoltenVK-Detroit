@@ -387,7 +387,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
 		}
 	}
 	if (shaderConfig.options.entryPointStage == spv::ExecutionModelVertex) {
-		for (uint32_t i = 0; i < 30; i++) {
+		for (uint32_t i = 0; i < 31; i++) {
 			if (pMSLCompiler->is_msl_shader_input_used(i)) {
 				bool found = false;
 				for (auto& ctxSI : shaderConfig.shaderInputs) {

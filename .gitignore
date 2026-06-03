@@ -36,3 +36,5 @@ Backup[ ]of[ ]*.key/
 Backup[ ]of[ ]*.numbers/
 
 MoltenVKOptions.cmake
+
+.vscode
