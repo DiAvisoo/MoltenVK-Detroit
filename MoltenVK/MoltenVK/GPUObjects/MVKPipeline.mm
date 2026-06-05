@@ -1190,8 +1190,38 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 		return nil;
 	}
 
+	SPIRVShaderInputs fragInputs;
+	if (pFragmentSS && !getShaderInputs(_fragmentModule->getSPIRV(), spv::ExecutionModelFragment, pFragmentSS->pName, fragInputs, errorLog) ) {
+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get fragment inputs: %s", errorLog.c_str()));
+		return nil;
+	}
+
+	// Ensure all fragment inputs are matched by vertex outputs.
+	// If a fragment input is missing or mismatched, align the vertex output to match.
+	for (auto& fi : fragInputs) {
+		if (fi.builtin == spv::BuiltInMax && fi.isUsed) {
+			bool found = false;
+			for (auto& vo : vtxOutputs) {
+				if (vo.location == fi.location) {
+					if (vo.baseType != fi.baseType) {
+						reportWarning(VK_ERROR_VALIDATION_FAILED, "Type mismatch at location %u: Vertex stage outputs type %d, but Fragment stage expects type %d. Aligning types.", fi.location, vo.baseType, fi.baseType);
+						vo.baseType = fi.baseType;
+					}
+					vo.isUsed = true;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				reportWarning(VK_ERROR_VALIDATION_FAILED, "Fragment shader uses input at location %u, but vertex shader does not output it. Adding dummy vertex output.", fi.location);
+				vtxOutputs.push_back(fi);
+				vtxOutputs.back().isUsed = true;
+			}
+		}
+	}
+
 	// Add shader stages. Compile vertex shader before others just in case conversion changes anything...like rasterizaion disable.
-	if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pVertexSS, pVertexFB, pFragmentSS)) { return nil; }
+	if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pVertexSS, pVertexFB, pFragmentSS)) { return nil; }
 
 	// Vertex input
 	// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
@@ -1409,6 +1439,7 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLTessRasterStageDescripto
 
 	SPIRVShaderOutputs tcOutputs, teOutputs;
 	SPIRVShaderInputs teInputs;
+	SPIRVShaderInputs fragInputs;
 	std::string errorLog;
 	if (!getShaderOutputs(_tessCtlModule->getSPIRV(), spv::ExecutionModelTessellationControl, pTessCtlSS->pName, tcOutputs, errorLog) ) {
 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get tessellation control outputs: %s", errorLog.c_str()));
@@ -1417,6 +1448,33 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLTessRasterStageDescripto
 	if (!getShaderOutputs(_tessEvalModule->getSPIRV(), spv::ExecutionModelTessellationEvaluation, pTessEvalSS->pName, teOutputs, errorLog) ) {
 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get tessellation evaluation outputs: %s", errorLog.c_str()));
 		return nil;
+	}
+	if (pFragmentSS && !getShaderInputs(_fragmentModule->getSPIRV(), spv::ExecutionModelFragment, pFragmentSS->pName, fragInputs, errorLog) ) {
+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get fragment inputs: %s", errorLog.c_str()));
+		return nil;
+	}
+
+	// Ensure all fragment inputs are matched by tessellation evaluation outputs.
+	for (auto& fi : fragInputs) {
+		if (fi.builtin == spv::BuiltInMax && fi.isUsed) {
+			bool found = false;
+			for (auto& vo : teOutputs) {
+				if (vo.location == fi.location) {
+					if (vo.baseType != fi.baseType) {
+						reportWarning(VK_ERROR_VALIDATION_FAILED, "Type mismatch at location %u: TessEval stage outputs type %d, but Fragment stage expects type %d. Aligning types.", fi.location, vo.baseType, fi.baseType);
+						vo.baseType = fi.baseType;
+					}
+					vo.isUsed = true;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				reportWarning(VK_ERROR_VALIDATION_FAILED, "Fragment shader uses input at location %u, but TessEval shader does not output it. Adding dummy TessEval output.", fi.location);
+				teOutputs.push_back(fi);
+				teOutputs.back().isUsed = true;
+			}
+		}
 	}
 
 	// Add shader stages. Compile tessellation evaluation shader before others just in case conversion changes anything...like rasterizaion disable.
@@ -1490,6 +1548,7 @@ bool MVKGraphicsPipeline::verifyImplicitBuffers(MVKShaderStage stage) {
 bool MVKGraphicsPipeline::addVertexShaderToPipeline(MTLRenderPipelineDescriptor* plDesc,
 													const VkGraphicsPipelineCreateInfo* pCreateInfo,
 													SPIRVToMSLConversionConfiguration& shaderConfig,
+													SPIRVShaderOutputs& vtxOutputs,
 													const VkPipelineShaderStageCreateInfo* pVertexSS,
 													VkPipelineCreationFeedback* pVertexFB,
 													const VkPipelineShaderStageCreateInfo*& pFragmentSS) {
@@ -1503,6 +1562,7 @@ bool MVKGraphicsPipeline::addVertexShaderToPipeline(MTLRenderPipelineDescriptor*
 	shaderConfig.options.mslOptions.capture_output_to_buffer = false;
 	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
 	addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
+	addNextStageInputToShaderConversionConfig(shaderConfig, vtxOutputs);
 
 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
 	id<MTLFunction> mtlFunc = func.getMTLFunction();
