@@ -2389,9 +2389,13 @@ void MVKGraphicsPipeline::addNextStageInputToShaderConversionConfig(SPIRVToMSLCo
 				break;
 
 			case kMVKFormatColorFloat:
+				sosv.format = MSL_SHADER_VARIABLE_FORMAT_FLOAT32;
+				break;
 			case kMVKFormatColorInt32:
+				sosv.format = MSL_SHADER_VARIABLE_FORMAT_INT32;
+				break;
 			case kMVKFormatColorUInt32:
-				sosv.format = MSL_SHADER_VARIABLE_FORMAT_ANY32;
+				sosv.format = MSL_SHADER_VARIABLE_FORMAT_UINT32;
 				break;
 
             default:
@@ -2434,9 +2438,13 @@ void MVKGraphicsPipeline::addPrevStageOutputToShaderConversionConfig(SPIRVToMSLC
 				break;
 
 			case kMVKFormatColorFloat:
+				sisv.format = MSL_SHADER_VARIABLE_FORMAT_FLOAT32;
+				break;
 			case kMVKFormatColorInt32:
+				sisv.format = MSL_SHADER_VARIABLE_FORMAT_INT32;
+				break;
 			case kMVKFormatColorUInt32:
-				sisv.format = MSL_SHADER_VARIABLE_FORMAT_ANY32;
+				sisv.format = MSL_SHADER_VARIABLE_FORMAT_UINT32;
 				break;
 
             default:
