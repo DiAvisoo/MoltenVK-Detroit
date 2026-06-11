@@ -42,7 +42,123 @@
 #include "MVKFoundation.h"
 #include "MVKOSExtensions.h"
 
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <mutex>
 #include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+
+
+static bool mvkDTRBoolEnvEnabled(const char* name) {
+	const char* env = getenv(name);
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static bool mvkDTRSurfaceLogEnabled() {
+	return mvkDTRBoolEnvEnabled("MVK_DTR_SURFACE_LOG");
+}
+
+static bool mvkDTRSurfaceLogAllAPIEnabled() {
+	return mvkDTRBoolEnvEnabled("MVK_DTR_SURFACE_LOG_API_ALL");
+}
+
+static bool mvkDTRCrashLogEnabled() {
+	return mvkDTRBoolEnvEnabled("MVK_DTR_CRASH_LOG");
+}
+
+static uint64_t mvkDTRCurrentThreadID() {
+	uint64_t tid = 0;
+	pthread_threadid_np(pthread_self(), &tid);
+	return tid;
+}
+
+static NSString* mvkDTRSurfaceLogPath() {
+	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	return @"/tmp/mvk-dtr-surface.log";
+}
+
+static char gMVKDTRCrashLogPath[PATH_MAX] = "/tmp/mvk-dtr-surface.log";
+
+static void mvkDTRCrashSignalHandler(int sig, siginfo_t* sigInfo, void* context) {
+	int fd = open(gMVKDTRCrashLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (fd >= 0) {
+		char msg[512];
+		int len = snprintf(msg, sizeof(msg), "MVK-DTR-CRASH: signal=%d code=%d addr=%p context=%p\n",
+						   sig, sigInfo ? sigInfo->si_code : 0, sigInfo ? sigInfo->si_addr : nullptr, context);
+		if (len > 0) {
+			size_t msgLen = (len < (int)sizeof(msg)) ? (size_t)len : sizeof(msg) - 1;
+			write(fd, msg, msgLen);
+		}
+		void* frames[128];
+		int frameCnt = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
+		backtrace_symbols_fd(frames, frameCnt, fd);
+		write(fd, "MVK-DTR-CRASH: end\n", 19);
+		close(fd);
+	}
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+static void mvkDTRInstallCrashHandlersIfNeeded() {
+	static std::once_flag crashHandlerOnce;
+	std::call_once(crashHandlerOnce, []{
+		if ( !mvkDTRCrashLogEnabled() ) { return; }
+		@autoreleasepool {
+			NSString* logPath = mvkDTRSurfaceLogPath();
+			[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
+			snprintf(gMVKDTRCrashLogPath, sizeof(gMVKDTRCrashLogPath), "%s", logPath.fileSystemRepresentation);
+		}
+
+		struct sigaction action = {};
+		action.sa_sigaction = mvkDTRCrashSignalHandler;
+		sigemptyset(&action.sa_mask);
+		action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+		sigaction(SIGABRT, &action, nullptr);
+		sigaction(SIGBUS, &action, nullptr);
+		sigaction(SIGILL, &action, nullptr);
+		sigaction(SIGSEGV, &action, nullptr);
+		sigaction(SIGTRAP, &action, nullptr);
+	});
+}
+
+static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
+static void mvkDTRSurfaceLog(const char* fmt, ...) {
+	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
+	mvkDTRInstallCrashHandlersIfNeeded();
+
+	char msg[2048];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+
+	static std::mutex logLock;
+	std::lock_guard<std::mutex> lock(logLock);
+	@autoreleasepool {
+		NSString* logPath = mvkDTRSurfaceLogPath();
+		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
+		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
+		if ( !logFile ) { return; }
+		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
+		fprintf(logFile, "%s MVK-DTR-API tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
+		fclose(logFile);
+	}
+}
 
 
 #pragma mark -
@@ -51,9 +167,11 @@
 // Optionally log start of function calls to stderr
 static inline uint64_t MVKTraceVulkanCallStartImpl(const char* funcName) {
 
+	bool includeEntry = false;
 	bool includeThread = false;
 	bool includeExit = false;
 	bool includeDuration = false;
+	bool dtrLogAllAPI = mvkDTRSurfaceLogAllAPIEnabled();
 
 	switch (getGlobalMVKConfig().traceVulkanCalls) {
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_DURATION:
@@ -61,6 +179,7 @@ static inline uint64_t MVKTraceVulkanCallStartImpl(const char* funcName) {
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_ENTER_EXIT:
 			includeExit = true;			// fallthrough
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_ENTER:
+			includeEntry = true;
 			break;
 
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_DURATION_THREAD_ID:
@@ -68,15 +187,18 @@ static inline uint64_t MVKTraceVulkanCallStartImpl(const char* funcName) {
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_ENTER_EXIT_THREAD_ID:
 			includeExit = true;			// fallthrough
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_ENTER_THREAD_ID:
+			includeEntry = true;
 			includeThread = true;		// fallthrough
 			break;
 
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_NONE:
 		default:
-			return 0;
+			break;
 	}
 
-	if (includeThread) {
+	if (dtrLogAllAPI) { mvkDTRSurfaceLog("api enter %s", funcName); }
+
+	if (includeEntry && includeThread) {
 		uint64_t gtid, mtid;
 		const uint32_t kThreadNameBuffSize = 256;
 		char threadName[kThreadNameBuffSize];
@@ -85,15 +207,19 @@ static inline uint64_t MVKTraceVulkanCallStartImpl(const char* funcName) {
 		pthread_threadid_np(tid, &gtid);		// Global system-wide thead ID
 		pthread_getname_np(tid, threadName, kThreadNameBuffSize);
 		fprintf(stderr, "[mvk-trace] %s()%s [%llu/%llu/%s]\n", funcName, includeExit ? " {" : "", mtid, gtid, threadName);
-	} else {
+	} else if (includeEntry) {
 		fprintf(stderr, "[mvk-trace] %s()%s\n", funcName, includeExit ? " {" : "");
 	}
 
-	return includeDuration ? mvkGetTimestamp() : 0;
+	return (includeDuration || dtrLogAllAPI) ? mvkGetTimestamp() : 0;
 }
 
 // Optionally log end of function calls and timings to stderr
 static inline void MVKTraceVulkanCallEndImpl(const char* funcName, uint64_t startTime) {
+	if (mvkDTRSurfaceLogAllAPIEnabled()) {
+		mvkDTRSurfaceLog("api exit %s duration_ms=%.4f", funcName, startTime ? mvkGetElapsedMilliseconds(startTime) : 0.0);
+	}
+
 	switch(getGlobalMVKConfig().traceVulkanCalls) {
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_ENTER_EXIT:
 		case MVK_CONFIG_TRACE_VULKAN_CALLS_ENTER_EXIT_THREAD_ID:
@@ -942,8 +1068,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkDestroyImage(
 	const VkAllocationCallbacks*                pAllocator) {
 
 	MVKTraceVulkanCallStart();
+	mvkDTRSurfaceLog("vkDestroyImage enter device=%p image=%p", device, image);
 	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
 	mvkDev->destroyImage((MVKImage*)image, pAllocator);
+	mvkDTRSurfaceLog("vkDestroyImage exit device=%p image=%p", device, image);
 	MVKTraceVulkanCallEnd();
 }
 
@@ -3502,8 +3630,13 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateSwapchainKHR(
     VkDevice                                 device,
     const VkSwapchainCreateInfoKHR*          pCreateInfo,
     const VkAllocationCallbacks*             pAllocator,
-    VkSwapchainKHR*                          pSwapchain) {
+	VkSwapchainKHR*                          pSwapchain) {
 
+	mvkDTRSurfaceLog("vkCreateSwapchainKHR enter device=%p surface=%p old=%p extent=%ux%u min_images=%u present_mode=%u format=%u usage=0x%x",
+					 device, pCreateInfo ? pCreateInfo->surface : VK_NULL_HANDLE, pCreateInfo ? pCreateInfo->oldSwapchain : VK_NULL_HANDLE,
+					 pCreateInfo ? pCreateInfo->imageExtent.width : 0, pCreateInfo ? pCreateInfo->imageExtent.height : 0,
+					 pCreateInfo ? pCreateInfo->minImageCount : 0, pCreateInfo ? pCreateInfo->presentMode : VK_PRESENT_MODE_MAX_ENUM_KHR,
+					 pCreateInfo ? pCreateInfo->imageFormat : VK_FORMAT_UNDEFINED, pCreateInfo ? pCreateInfo->imageUsage : 0);
 	MVKTraceVulkanCallStart();
     MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
     VkResult rslt = mvkDev->getConfigurationResult();
@@ -3514,30 +3647,35 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateSwapchainKHR(
         if (rslt < 0) { *pSwapchain = VK_NULL_HANDLE; mvkDev->destroySwapchain(mvkSwpChn, pAllocator); }
     }
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkCreateSwapchainKHR exit result=%d swapchain=%p", rslt, pSwapchain ? *pSwapchain : VK_NULL_HANDLE);
 	return rslt;
 }
 
 MVK_PUBLIC_VULKAN_SYMBOL void vkDestroySwapchainKHR(
     VkDevice                                 device,
     VkSwapchainKHR                           swapchain,
-    const VkAllocationCallbacks*             pAllocator) {
+	const VkAllocationCallbacks*             pAllocator) {
 
+	mvkDTRSurfaceLog("vkDestroySwapchainKHR enter device=%p swapchain=%p", device, swapchain);
 	MVKTraceVulkanCallStart();
     MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
     mvkDev->destroySwapchain((MVKSwapchain*)swapchain, pAllocator);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkDestroySwapchainKHR exit device=%p swapchain=%p", device, swapchain);
 }
 
 MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetSwapchainImagesKHR(
     VkDevice                                 device,
     VkSwapchainKHR                           swapchain,
     uint32_t*                                pCount,
-    VkImage*                                 pSwapchainImages) {
+	VkImage*                                 pSwapchainImages) {
 
+	mvkDTRSurfaceLog("vkGetSwapchainImagesKHR enter device=%p swapchain=%p requested=%u populate=%u", device, swapchain, pCount ? *pCount : 0, pSwapchainImages ? 1 : 0);
 	MVKTraceVulkanCallStart();
     MVKSwapchain* mvkSwapchain = (MVKSwapchain*)swapchain;
     VkResult rslt = mvkSwapchain->getImages(pCount, pSwapchainImages);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkGetSwapchainImagesKHR exit result=%d returned=%u first=%p", rslt, pCount ? *pCount : 0, (pSwapchainImages && pCount && *pCount) ? pSwapchainImages[0] : VK_NULL_HANDLE);
 	return rslt;
 }
 
@@ -3547,23 +3685,43 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkAcquireNextImageKHR(
     uint64_t                                     timeout,
     VkSemaphore                                  semaphore,
     VkFence                                      fence,
-    uint32_t*                                    pImageIndex) {
+	uint32_t*                                    pImageIndex) {
 
+	mvkDTRSurfaceLog("vkAcquireNextImageKHR enter device=%p swapchain=%p timeout=%llu sem=%p fence=%p", device, swapchain, (unsigned long long)timeout, semaphore, fence);
 	MVKTraceVulkanCallStart();
     MVKSwapchain* mvkSwapchain = (MVKSwapchain*)swapchain;
     VkResult rslt = mvkSwapchain->acquireNextImage(timeout, semaphore, fence, ~0u, pImageIndex);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkAcquireNextImageKHR exit result=%d index=%u", rslt, pImageIndex ? *pImageIndex : 0);
 	return rslt;
 }
 
 MVK_PUBLIC_VULKAN_SYMBOL VkResult vkQueuePresentKHR(
     VkQueue                                      queue,
-    const VkPresentInfoKHR*                      pPresentInfo) {
+	const VkPresentInfoKHR*                      pPresentInfo) {
 
+	mvkDTRSurfaceLog("vkQueuePresentKHR enter queue=%p swapchains=%u waits=%u pResults=%p first_swapchain=%p first_index=%u",
+					 queue, pPresentInfo ? pPresentInfo->swapchainCount : 0, pPresentInfo ? pPresentInfo->waitSemaphoreCount : 0,
+					 pPresentInfo ? pPresentInfo->pResults : nullptr,
+					 (pPresentInfo && pPresentInfo->swapchainCount) ? pPresentInfo->pSwapchains[0] : VK_NULL_HANDLE,
+					 (pPresentInfo && pPresentInfo->swapchainCount) ? pPresentInfo->pImageIndices[0] : 0);
+	if (pPresentInfo && pPresentInfo->pResults) {
+		for (uint32_t scIdx = 0; scIdx < pPresentInfo->swapchainCount; scIdx++) {
+			mvkDTRSurfaceLog("vkQueuePresentKHR pResults before queue=%p ordinal=%u swapchain=%p slot=%p",
+							 queue, scIdx, pPresentInfo->pSwapchains[scIdx], &pPresentInfo->pResults[scIdx]);
+		}
+	}
 	MVKTraceVulkanCallStart();
     MVKQueue* mvkQ = MVKQueue::getMVKQueue(queue);
     VkResult rslt = mvkQ->submit(pPresentInfo);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkQueuePresentKHR exit queue=%p result=%d pResults=%p", queue, rslt, pPresentInfo ? pPresentInfo->pResults : nullptr);
+	if (pPresentInfo && pPresentInfo->pResults) {
+		for (uint32_t scIdx = 0; scIdx < pPresentInfo->swapchainCount; scIdx++) {
+			mvkDTRSurfaceLog("vkQueuePresentKHR pResults after queue=%p ordinal=%u swapchain=%p slot=%p value=%d top_result=%d",
+							 queue, scIdx, pPresentInfo->pSwapchains[scIdx], &pPresentInfo->pResults[scIdx], pPresentInfo->pResults[scIdx], rslt);
+		}
+	}
 	return rslt;
 }
 
@@ -3610,14 +3768,16 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkAcquireNextImage2KHR(
 	const VkAcquireNextImageInfoKHR*            pAcquireInfo,
 	uint32_t*                                   pImageIndex) {
 
+	mvkDTRSurfaceLog("vkAcquireNextImage2KHR enter device=%p swapchain=%p timeout=%llu sem=%p fence=%p mask=0x%x", device, pAcquireInfo ? pAcquireInfo->swapchain : VK_NULL_HANDLE, pAcquireInfo ? (unsigned long long)pAcquireInfo->timeout : 0ULL, pAcquireInfo ? pAcquireInfo->semaphore : VK_NULL_HANDLE, pAcquireInfo ? pAcquireInfo->fence : VK_NULL_HANDLE, pAcquireInfo ? pAcquireInfo->deviceMask : 0);
 	MVKTraceVulkanCallStart();
 	MVKSwapchain* mvkSwapchain = (MVKSwapchain*)pAcquireInfo->swapchain;
 	VkResult rslt = mvkSwapchain->acquireNextImage(pAcquireInfo->timeout,
 												   pAcquireInfo->semaphore,
 												   pAcquireInfo->fence,
 												   pAcquireInfo->deviceMask,
-												   pImageIndex);
+										   pImageIndex);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkAcquireNextImage2KHR exit result=%d index=%u", rslt, pImageIndex ? *pImageIndex : 0);
 	return rslt;
 }
 
@@ -3649,12 +3809,14 @@ MVK_PUBLIC_VULKAN_ALIAS(vkReleaseSwapchainImagesEXT, vkReleaseSwapchainImagesKHR
 MVK_PUBLIC_VULKAN_SYMBOL void vkDestroySurfaceKHR(
     VkInstance                                   instance,
     VkSurfaceKHR                                 surface,
-    const VkAllocationCallbacks*                 pAllocator) {
+	const VkAllocationCallbacks*                 pAllocator) {
 
+	mvkDTRSurfaceLog("vkDestroySurfaceKHR enter instance=%p surface=%p", instance, surface);
 	MVKTraceVulkanCallStart();
     MVKInstance* mvkInst = MVKInstance::getMVKInstance(instance);
     mvkInst->destroySurface((MVKSurface*)surface, pAllocator);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkDestroySurfaceKHR exit instance=%p surface=%p", instance, surface);
 }
 
 MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceSurfaceSupportKHR(
@@ -3674,12 +3836,17 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceSurfaceSupportKHR(
 MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     VkPhysicalDevice                            physicalDevice,
     VkSurfaceKHR                                surface,
-    VkSurfaceCapabilitiesKHR*                   pSurfaceCapabilities) {
+	VkSurfaceCapabilitiesKHR*                   pSurfaceCapabilities) {
 
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceCapabilitiesKHR enter physicalDevice=%p surface=%p", physicalDevice, surface);
 	MVKTraceVulkanCallStart();
     MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
     VkResult rslt = mvkPD->getSurfaceCapabilities(surface, pSurfaceCapabilities);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceCapabilitiesKHR exit result=%d current=%ux%u min=%ux%u max=%ux%u", rslt,
+					 pSurfaceCapabilities ? pSurfaceCapabilities->currentExtent.width : 0, pSurfaceCapabilities ? pSurfaceCapabilities->currentExtent.height : 0,
+					 pSurfaceCapabilities ? pSurfaceCapabilities->minImageExtent.width : 0, pSurfaceCapabilities ? pSurfaceCapabilities->minImageExtent.height : 0,
+					 pSurfaceCapabilities ? pSurfaceCapabilities->maxImageExtent.width : 0, pSurfaceCapabilities ? pSurfaceCapabilities->maxImageExtent.height : 0);
 	return rslt;
 }
 
@@ -3687,13 +3854,15 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceSurfaceFormatsKHR(
     VkPhysicalDevice                            physicalDevice,
     VkSurfaceKHR                                surface,
     uint32_t*                                   pSurfaceFormatCount,
-    VkSurfaceFormatKHR*                         pSurfaceFormats) {
+	VkSurfaceFormatKHR*                         pSurfaceFormats) {
 
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceFormatsKHR enter physicalDevice=%p surface=%p requested=%u populate=%u", physicalDevice, surface, pSurfaceFormatCount ? *pSurfaceFormatCount : 0, pSurfaceFormats ? 1 : 0);
 	MVKTraceVulkanCallStart();
     MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
     MVKSurface* mvkSrfc = (MVKSurface*)surface;
     VkResult rslt = mvkPD->getSurfaceFormats(mvkSrfc, pSurfaceFormatCount, pSurfaceFormats);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceFormatsKHR exit result=%d returned=%u", rslt, pSurfaceFormatCount ? *pSurfaceFormatCount : 0);
 	return rslt;
 }
 
@@ -3701,13 +3870,15 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceSurfacePresentModesKHR(
     VkPhysicalDevice                            physicalDevice,
     VkSurfaceKHR                                surface,
     uint32_t*                                   pPresentModeCount,
-    VkPresentModeKHR*                           pPresentModes) {
+	VkPresentModeKHR*                           pPresentModes) {
 
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfacePresentModesKHR enter physicalDevice=%p surface=%p requested=%u populate=%u", physicalDevice, surface, pPresentModeCount ? *pPresentModeCount : 0, pPresentModes ? 1 : 0);
 	MVKTraceVulkanCallStart();
     MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
     MVKSurface* mvkSrfc = (MVKSurface*)surface;
     VkResult rslt = mvkPD->getSurfacePresentModes(mvkSrfc, pPresentModeCount, pPresentModes);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfacePresentModesKHR exit result=%d returned=%u", rslt, pPresentModeCount ? *pPresentModeCount : 0);
 	return rslt;
 }
 
@@ -3720,10 +3891,14 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceSurfaceCapabilities2KHR(
 	const VkPhysicalDeviceSurfaceInfo2KHR*      pSurfaceInfo,
 	VkSurfaceCapabilities2KHR*                  pSurfaceCapabilities) {
 
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceCapabilities2KHR enter physicalDevice=%p surface=%p", physicalDevice, pSurfaceInfo ? pSurfaceInfo->surface : VK_NULL_HANDLE);
 	MVKTraceVulkanCallStart();
 	MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
 	VkResult rslt = mvkPD->getSurfaceCapabilities(pSurfaceInfo, pSurfaceCapabilities);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceCapabilities2KHR exit result=%d current=%ux%u", rslt,
+					 pSurfaceCapabilities ? pSurfaceCapabilities->surfaceCapabilities.currentExtent.width : 0,
+					 pSurfaceCapabilities ? pSurfaceCapabilities->surfaceCapabilities.currentExtent.height : 0);
 	return rslt;
 }
 
@@ -3733,11 +3908,13 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceSurfaceFormats2KHR(
 	uint32_t*                                   pSurfaceFormatCount,
 	VkSurfaceFormat2KHR*                        pSurfaceFormats) {
 
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceFormats2KHR enter physicalDevice=%p surface=%p requested=%u populate=%u", physicalDevice, pSurfaceInfo ? pSurfaceInfo->surface : VK_NULL_HANDLE, pSurfaceFormatCount ? *pSurfaceFormatCount : 0, pSurfaceFormats ? 1 : 0);
 	MVKTraceVulkanCallStart();
 	MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
 	MVKSurface* mvkSrfc = (MVKSurface*)pSurfaceInfo->surface;
 	VkResult rslt = mvkPD->getSurfaceFormats(mvkSrfc, pSurfaceFormatCount, pSurfaceFormats);
 	MVKTraceVulkanCallEnd();
+	mvkDTRSurfaceLog("vkGetPhysicalDeviceSurfaceFormats2KHR exit result=%d returned=%u", rslt, pSurfaceFormatCount ? *pSurfaceFormatCount : 0);
 	return rslt;
 }
 
@@ -4485,4 +4662,3 @@ MVK_PUBLIC_SYMBOL PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(
 	MVKTraceVulkanCallEnd();
 	return func;
 }
-

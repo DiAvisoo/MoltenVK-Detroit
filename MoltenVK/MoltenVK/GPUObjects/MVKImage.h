@@ -346,6 +346,8 @@ public:
 
 	MVKImage(MVKDevice* device, const VkImageCreateInfo* pCreateInfo);
 
+	void destroy() override;
+
 	~MVKImage() override;
 
 protected:
@@ -362,6 +364,7 @@ protected:
 	uint32_t validateMipLevels(const VkImageCreateInfo* pCreateInfo, bool isAttachment);
 	bool validateLinear(const VkImageCreateInfo* pCreateInfo, bool isAttachment);
 	void initExternalMemory(VkExternalMemoryHandleTypeFlags handleTypes);
+	void detachMemory();
     void releaseIOSurface();
 	bool getIsValidViewFormat(VkFormat viewFormat);
 	VkImageUsageFlags getCombinedUsage() { return _usage | _stencilUsage; }

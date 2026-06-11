@@ -26,6 +26,10 @@
 #include "MTLRenderPipelineDescriptor+MoltenVK.h"
 #include "mvk_datatypes.hpp"
 #include <sys/stat.h>
+#include <atomic>
+#include <cstdarg>
+#include <cstdlib>
+#include <limits.h>
 #include <sstream>
 
 #ifndef MVK_USE_CEREAL
@@ -42,6 +46,595 @@
 using namespace std;
 using namespace mvk;
 using namespace SPIRV_CROSS_NAMESPACE;
+
+
+#define MVK_DTR_BINARY_ARCHIVE_LOG_PREFIX "MVK-DTR-BINARY-ARCHIVE: "
+#define MVK_DTR_BINARY_ARCHIVE_SERIALIZE_INTERVAL 500
+
+static NSString* mvkDTRBinaryArchiveLogPath() {
+	const char* logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) {
+		return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath];
+	}
+
+	const char* archivePathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_PATH");
+	if (archivePathEnv && *archivePathEnv) {
+		return [[[NSString stringWithUTF8String: archivePathEnv] stringByExpandingTildeInPath] stringByAppendingString: @".log"];
+	}
+
+	NSArray<NSString*>* cacheDirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+	NSString* cacheRoot = cacheDirs.count ? cacheDirs[0] : [NSHomeDirectory() stringByAppendingPathComponent: @"Library/Caches"];
+	return [[cacheRoot stringByAppendingPathComponent: @"MoltenVK"] stringByAppendingPathComponent: @"detroit-binary-archive.log"];
+}
+
+static void mvkDTRBinaryArchiveLog(MVKConfigLogLevel logLevel, const char* fmt, ...) __printflike(2, 3);
+static void mvkDTRBinaryArchiveLog(MVKConfigLogLevel logLevel, const char* fmt, ...) {
+	char msg[2048];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+
+	const char* stderrLevel = logLevel <= MVK_CONFIG_LOG_LEVEL_WARNING ? "warning" : "info";
+	fprintf(stderr, "[mvk-%s] %s%s\n", stderrLevel, MVK_DTR_BINARY_ARCHIVE_LOG_PREFIX, msg);
+
+	static mutex logLock;
+	lock_guard<mutex> lock(logLock);
+	@autoreleasepool {
+		NSString* logPath = mvkDTRBinaryArchiveLogPath();
+		NSString* logDir = [logPath stringByDeletingLastPathComponent];
+		[[NSFileManager defaultManager] createDirectoryAtPath: logDir withIntermediateDirectories: YES attributes: nil error: nil];
+
+		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
+		if ( !logFile ) { return; }
+
+		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
+		fprintf(logFile, "%s %s%s\n", timestamp.UTF8String, MVK_DTR_BINARY_ARCHIVE_LOG_PREFIX, msg);
+		fclose(logFile);
+	}
+}
+
+#define MVK_DTR_BINARY_ARCHIVE_LOG_INFO(fmt, ...) \
+	mvkDTRBinaryArchiveLog(MVK_CONFIG_LOG_LEVEL_INFO, fmt, ##__VA_ARGS__)
+
+#define MVK_DTR_BINARY_ARCHIVE_LOG_WARN(fmt, ...) \
+	mvkDTRBinaryArchiveLog(MVK_CONFIG_LOG_LEVEL_WARNING, fmt, ##__VA_ARGS__)
+
+#define MVK_DTR_SHADER_CACHE_LOG_INTERVAL 100
+#define MVK_DTR_SHADER_CACHE_LOCK_WAIT_NS 1000000ULL
+
+static const char* mvkDTRShaderStageName(spv::ExecutionModel stage) {
+	switch (stage) {
+		case spv::ExecutionModelVertex: return "vertex";
+		case spv::ExecutionModelTessellationControl: return "tess-control";
+		case spv::ExecutionModelTessellationEvaluation: return "tess-eval";
+		case spv::ExecutionModelFragment: return "fragment";
+		case spv::ExecutionModelGLCompute: return "compute";
+		default: return "unknown";
+	}
+}
+
+static bool mvkDTRShaderCacheConcurrentCompileEnabled() {
+	const char* env = getenv("MVK_DTR_SHADER_CACHE_CONCURRENT_COMPILE");
+	return !env || strcmp(env, "0") != 0;
+}
+
+static bool mvkDTRArgumentBufferNoPaddingEnabled() {
+	static bool enabled = []() {
+		const char* oldEnv = getenv("MVK_DTR_ARGUMENT_BUFFER_NO_PADDING");
+		if (oldEnv && strcmp(oldEnv, "1") == 0) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("MVK_DTR_ARGUMENT_BUFFER_NO_PADDING=1 ignored after device-lost testing; use MVK_DTR_ARGUMENT_BUFFER_NO_PADDING_UNSAFE=1 only for targeted diagnostics");
+		}
+
+		const char* env = getenv("MVK_DTR_ARGUMENT_BUFFER_NO_PADDING_UNSAFE");
+		bool isEnabled = env && strcmp(env, "1") == 0;
+		if (isEnabled) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("argument buffer padding disabled by MVK_DTR_ARGUMENT_BUFFER_NO_PADDING_UNSAFE=1");
+		}
+		return isEnabled;
+	}();
+	return enabled;
+}
+
+class MVKDTRShaderCacheDiagnostics {
+public:
+	static MVKDTRShaderCacheDiagnostics& get() {
+		static MVKDTRShaderCacheDiagnostics diag;
+		return diag;
+	}
+
+	void recordHit(const MVKShaderModuleKey& smKey, const SPIRVToMSLConversionConfiguration* pContext) {
+		if ( !_enabled ) { return; }
+		uint64_t count = _hits.fetch_add(1, memory_order_relaxed) + 1;
+		if (_verbose || count == 1 || count % (MVK_DTR_SHADER_CACHE_LOG_INTERVAL * 5) == 0) {
+			logSummary("shader cache hit", count, smKey, pContext, 0, 0);
+		}
+	}
+
+	void recordMiss(const MVKShaderModuleKey& smKey, const SPIRVToMSLConversionConfiguration* pContext, size_t cacheEntries) {
+		if ( !_enabled ) { return; }
+		uint64_t count = _misses.fetch_add(1, memory_order_relaxed) + 1;
+		if (_verbose || count == 1 || count % MVK_DTR_SHADER_CACHE_LOG_INTERVAL == 0) {
+			logSummary("shader cache miss", count, smKey, pContext, cacheEntries, 0);
+		}
+	}
+
+	void recordCompiled(const MVKShaderModuleKey& smKey,
+						const SPIRVToMSLConversionConfiguration* pContext,
+						uint64_t compileNanos,
+						size_t cacheEntries) {
+		if ( !_enabled ) { return; }
+		uint64_t count = _compiles.fetch_add(1, memory_order_relaxed) + 1;
+		uint64_t totalNanos = _compileNanos.fetch_add(compileNanos, memory_order_relaxed) + compileNanos;
+		if (_verbose || count == 1 || count % MVK_DTR_SHADER_CACHE_LOG_INTERVAL == 0) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("shader cache compiled #%llu stage=%s entry=%s module=%016zx compile=%.1fms avg=%.1fms cache_entries=%zu hits=%llu misses=%llu duplicates=%llu",
+										 (unsigned long long)count,
+										 mvkDTRShaderStageName(pContext->options.entryPointStage),
+										 pContext->options.entryPointName.c_str(),
+										 smKey.codeHash,
+										 (double)compileNanos / 1e6,
+										 ((double)totalNanos / (double)count) / 1e6,
+										 cacheEntries,
+										 (unsigned long long)_hits.load(memory_order_relaxed),
+										 (unsigned long long)_misses.load(memory_order_relaxed),
+										 (unsigned long long)_duplicates.load(memory_order_relaxed));
+		}
+	}
+
+	void recordDuplicate(const MVKShaderModuleKey& smKey,
+						 const SPIRVToMSLConversionConfiguration* pContext,
+						 uint64_t compileNanos) {
+		if ( !_enabled ) { return; }
+		uint64_t count = _duplicates.fetch_add(1, memory_order_relaxed) + 1;
+		if (_verbose || count == 1 || count % MVK_DTR_SHADER_CACHE_LOG_INTERVAL == 0) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("shader cache duplicate compile #%llu stage=%s entry=%s module=%016zx discarded_after=%.1fms",
+										 (unsigned long long)count,
+										 mvkDTRShaderStageName(pContext->options.entryPointStage),
+										 pContext->options.entryPointName.c_str(),
+										 smKey.codeHash,
+										 (double)compileNanos / 1e6);
+		}
+	}
+
+	void recordLockWait(uint64_t waitNanos) {
+		if ( !_enabled || waitNanos < MVK_DTR_SHADER_CACHE_LOCK_WAIT_NS ) { return; }
+		uint64_t count = _lockWaits.fetch_add(1, memory_order_relaxed) + 1;
+		uint64_t totalNanos = _lockWaitNanos.fetch_add(waitNanos, memory_order_relaxed) + waitNanos;
+		if (_verbose || count <= 10 || count % MVK_DTR_SHADER_CACHE_LOG_INTERVAL == 0) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("shader cache lock wait #%llu wait=%.1fms avg=%.1fms",
+										 (unsigned long long)count,
+										 (double)waitNanos / 1e6,
+										 ((double)totalNanos / (double)count) / 1e6);
+		}
+	}
+
+	void recordCompileSkipped(const MVKShaderModuleKey& smKey, const SPIRVToMSLConversionConfiguration* pContext) {
+		if ( !_enabled ) { return; }
+		uint64_t count = _skipped.fetch_add(1, memory_order_relaxed) + 1;
+		if (_verbose || count == 1 || count % MVK_DTR_SHADER_CACHE_LOG_INTERVAL == 0) {
+			logSummary("shader cache compile skipped", count, smKey, pContext, 0, 0);
+		}
+	}
+
+private:
+	MVKDTRShaderCacheDiagnostics() {
+		const char* env = getenv("MVK_DTR_SHADER_CACHE_LOG");
+		_enabled = env && strcmp(env, "1") == 0;
+		_verbose = getenv("MVK_DTR_SHADER_CACHE_VERBOSE") && strcmp(getenv("MVK_DTR_SHADER_CACHE_VERBOSE"), "1") == 0;
+		if (_enabled) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("shader cache diagnostics enabled%s, concurrent_compile=%s", _verbose ? ", verbose" : "", mvkDTRShaderCacheConcurrentCompileEnabled() ? "1" : "0");
+		}
+	}
+
+	void logSummary(const char* label,
+					uint64_t count,
+					const MVKShaderModuleKey& smKey,
+					const SPIRVToMSLConversionConfiguration* pContext,
+					size_t cacheEntries,
+					uint64_t extraNanos) {
+		MVK_DTR_BINARY_ARCHIVE_LOG_INFO("%s #%llu stage=%s entry=%s module=%016zx cache_entries=%zu hits=%llu misses=%llu compiles=%llu skipped=%llu extra=%.1fms",
+								 label,
+								 (unsigned long long)count,
+								 mvkDTRShaderStageName(pContext->options.entryPointStage),
+								 pContext->options.entryPointName.c_str(),
+								 smKey.codeHash,
+								 cacheEntries,
+								 (unsigned long long)_hits.load(memory_order_relaxed),
+								 (unsigned long long)_misses.load(memory_order_relaxed),
+								 (unsigned long long)_compiles.load(memory_order_relaxed),
+								 (unsigned long long)_skipped.load(memory_order_relaxed),
+								 (double)extraNanos / 1e6);
+	}
+
+	bool _enabled = false;
+	bool _verbose = false;
+	atomic<uint64_t> _hits{0};
+	atomic<uint64_t> _misses{0};
+	atomic<uint64_t> _compiles{0};
+	atomic<uint64_t> _duplicates{0};
+	atomic<uint64_t> _skipped{0};
+	atomic<uint64_t> _lockWaits{0};
+	atomic<uint64_t> _lockWaitNanos{0};
+	atomic<uint64_t> _compileNanos{0};
+};
+
+class MVKDTRBinaryArchiveManager {
+public:
+	static MVKDTRBinaryArchiveManager& get() {
+		static MVKDTRBinaryArchiveManager mgr;
+		return mgr;
+	}
+
+	void attach(MTLRenderPipelineDescriptor* plDesc, id<MTLDevice> mtlDev) {
+		if ( !_enabled || !_enableRender || !plDesc || !mtlDev || isRenderAttachDisabled() ) { return; }
+
+#if MVK_MACOS_OR_IOS
+		if (@available(macOS 11.0, iOS 14.0, *)) {
+			id<MTLBinaryArchive> archive = newRetainedArchive(mtlDev);
+			if ( !archive ) { return; }
+
+			plDesc.binaryArchives = [NSArray arrayWithObject: archive];
+			markAttached("render");
+			[archive release];
+		} else {
+			logUnavailableOnce();
+		}
+#else
+		logUnavailableOnce();
+#endif
+	}
+
+	void attach(MTLComputePipelineDescriptor* plDesc, id<MTLDevice> mtlDev) {
+		if ( !_enabled || !_enableCompute || !plDesc || !mtlDev || isComputeAttachDisabled() ) { return; }
+
+#if MVK_MACOS_OR_IOS
+		if (@available(macOS 11.0, iOS 14.0, *)) {
+			id<MTLBinaryArchive> archive = newRetainedArchive(mtlDev);
+			if ( !archive ) { return; }
+
+			plDesc.binaryArchives = [NSArray arrayWithObject: archive];
+			markAttached("compute");
+			[archive release];
+		} else {
+			logUnavailableOnce();
+		}
+#else
+		logUnavailableOnce();
+#endif
+	}
+
+	void add(MTLRenderPipelineDescriptor* plDesc, id<MTLDevice> mtlDev) {
+		if ( !_enabled || !_enableRender || !_populate || !plDesc || !mtlDev ) { return; }
+
+#if MVK_MACOS_OR_IOS
+		if (@available(macOS 11.0, iOS 14.0, *)) {
+			id<MTLBinaryArchive> archive = newRetainedArchive(mtlDev);
+			if ( !archive ) { return; }
+
+			unique_lock<mutex> addLock(_archiveAddLock, try_to_lock);
+			if ( !addLock.owns_lock() ) {
+				logSkippedAdd("render");
+				[archive release];
+				return;
+			}
+
+			NSError* err = nil;
+			if ([archive addRenderPipelineFunctionsWithDescriptor: plDesc error: &err]) {
+				markDirty("render");
+			} else {
+				logAddFailure("render", err);
+			}
+			[archive release];
+		} else {
+			logUnavailableOnce();
+		}
+#else
+		logUnavailableOnce();
+#endif
+	}
+
+	void add(MTLComputePipelineDescriptor* plDesc, id<MTLDevice> mtlDev) {
+		if ( !_enabled || !_enableCompute || !_populate || !plDesc || !mtlDev ) { return; }
+
+#if MVK_MACOS_OR_IOS
+		if (@available(macOS 11.0, iOS 14.0, *)) {
+			id<MTLBinaryArchive> archive = newRetainedArchive(mtlDev);
+			if ( !archive ) { return; }
+
+			unique_lock<mutex> addLock(_archiveAddLock, try_to_lock);
+			if ( !addLock.owns_lock() ) {
+				logSkippedAdd("compute");
+				[archive release];
+				return;
+			}
+
+			NSError* err = nil;
+			if ([archive addComputePipelineFunctionsWithDescriptor: plDesc error: &err]) {
+				markDirty("compute");
+			} else {
+				logAddFailure("compute", err);
+			}
+			[archive release];
+		} else {
+			logUnavailableOnce();
+		}
+#else
+		logUnavailableOnce();
+#endif
+	}
+
+	void serialize() {
+		if ( !_enabled ) { return; }
+		lock_guard<mutex> lock(_lock);
+		serializeLocked();
+	}
+
+	bool retryRenderWithoutArchive(MTLRenderPipelineDescriptor* plDesc) {
+		if ( !_enabled || !_enableRender || !plDesc ) { return false; }
+
+#if MVK_MACOS_OR_IOS
+		if (@available(macOS 11.0, iOS 14.0, *)) {
+			if (plDesc.binaryArchives.count == 0) { return false; }
+
+			plDesc.binaryArchives = nil;
+			lock_guard<mutex> lock(_lock);
+			_renderAttachDisabled = true;
+			if (!_renderRetryLogged) {
+				MVK_DTR_BINARY_ARCHIVE_LOG_WARN("render pipeline failed with archive; retrying without archive and disabling render attachment for this process");
+				_renderRetryLogged = true;
+			}
+			return true;
+		}
+#endif
+		return false;
+	}
+
+	bool retryComputeWithoutArchive(MTLComputePipelineDescriptor* plDesc) {
+		if ( !_enabled || !_enableCompute || !plDesc ) { return false; }
+
+#if MVK_MACOS_OR_IOS
+		if (@available(macOS 11.0, iOS 14.0, *)) {
+			if (plDesc.binaryArchives.count == 0) { return false; }
+
+			plDesc.binaryArchives = nil;
+			lock_guard<mutex> lock(_lock);
+			_computeAttachDisabled = true;
+			if (!_computeRetryLogged) {
+				MVK_DTR_BINARY_ARCHIVE_LOG_WARN("compute pipeline failed with archive; retrying without archive and disabling compute attachment for this process");
+				_computeRetryLogged = true;
+			}
+			return true;
+		}
+#endif
+		return false;
+	}
+
+	~MVKDTRBinaryArchiveManager() {
+		serialize();
+		[_archive release];
+		[_mtlDevice release];
+		[_archiveURL release];
+		[_archivePath release];
+	}
+
+private:
+	MVKDTRBinaryArchiveManager() {
+		const char* enableEnv = getenv("MVK_DTR_BINARY_ARCHIVE_ENABLE");
+		const char* pathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_PATH");
+		const char* populateEnv = getenv("MVK_DTR_BINARY_ARCHIVE_POPULATE");
+		const char* renderEnv = getenv("MVK_DTR_BINARY_ARCHIVE_RENDER_ENABLE");
+		const char* computeEnv = getenv("MVK_DTR_BINARY_ARCHIVE_COMPUTE_ENABLE");
+		_enabled = (enableEnv && strcmp(enableEnv, "0") == 0) ? false : ((enableEnv && strcmp(enableEnv, "1") == 0) || (pathEnv && *pathEnv));
+		_populate = populateEnv && strcmp(populateEnv, "1") == 0;
+		_enableRender = !renderEnv || strcmp(renderEnv, "0") != 0;
+		_enableCompute = computeEnv && strcmp(computeEnv, "1") == 0;
+		_verbose = getenv("MVK_DTR_BINARY_ARCHIVE_VERBOSE") && strcmp(getenv("MVK_DTR_BINARY_ARCHIVE_VERBOSE"), "1") == 0;
+		if (_enabled) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("enabled%s%s%s, file log = %s", _populate ? "" : ", attach-only mode", _enableRender ? ", render enabled" : ", render disabled", _enableCompute ? ", compute enabled" : ", compute disabled", mvkDTRBinaryArchiveLogPath().UTF8String);
+		}
+	}
+
+	bool isRenderAttachDisabled() {
+		lock_guard<mutex> lock(_lock);
+		return _renderAttachDisabled;
+	}
+
+	bool isComputeAttachDisabled() {
+		lock_guard<mutex> lock(_lock);
+		return _computeAttachDisabled;
+	}
+
+	id<MTLBinaryArchive> newRetainedArchive(id<MTLDevice> mtlDev) {
+		lock_guard<mutex> lock(_lock);
+		return [getArchive(mtlDev) retain];
+	}
+
+	id<MTLBinaryArchive> getArchive(id<MTLDevice> mtlDev) {
+		if (_archive) {
+			if (_mtlDevice == mtlDev) { return _archive; }
+			if (!_deviceMismatchLogged) {
+				MVK_DTR_BINARY_ARCHIVE_LOG_WARN("device mismatch, archive disabled for additional device %s", mtlDev.name.UTF8String);
+				_deviceMismatchLogged = true;
+			}
+			return nil;
+		}
+
+		if (_creationAttempted) { return nil; }
+		_creationAttempted = true;
+
+		_archivePath = [newArchivePath(mtlDev) retain];
+		_archiveURL = [[NSURL fileURLWithPath: _archivePath] retain];
+		createArchiveDirectory();
+
+		NSFileManager* fm = [NSFileManager defaultManager];
+		BOOL archiveExists = [fm fileExistsAtPath: _archivePath];
+		BOOL loadedExisting = false;
+		NSError* err = nil;
+		MTLBinaryArchiveDescriptor* desc = [MTLBinaryArchiveDescriptor new];
+		if (archiveExists) { desc.url = _archiveURL; }
+		_archive = [mtlDev newBinaryArchiveWithDescriptor: desc error: &err];
+		[desc release];
+
+		if (_archive) {
+			loadedExisting = archiveExists;
+		} else if (archiveExists) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("failed to load archive from %s: %s; recreating", _archivePath.UTF8String, errorString(err));
+			err = nil;
+			[fm removeItemAtURL: _archiveURL error: nil];
+			MTLBinaryArchiveDescriptor* emptyDesc = [MTLBinaryArchiveDescriptor new];
+			_archive = [mtlDev newBinaryArchiveWithDescriptor: emptyDesc error: &err];
+			[emptyDesc release];
+		}
+
+		if ( !_archive ) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("failed to create archive at %s: %s; disabled", _archivePath.UTF8String, errorString(err));
+			return nil;
+		}
+
+		_mtlDevice = [mtlDev retain];
+		_archive.label = @"MoltenVK Detroit Binary Archive";
+		if (loadedExisting) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("loaded archive from %s", _archivePath.UTF8String);
+		} else {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("created new archive at %s", _archivePath.UTF8String);
+		}
+		return _archive;
+	}
+
+	NSString* newArchivePath(id<MTLDevice> mtlDev) {
+		const char* pathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_PATH");
+		if (pathEnv && *pathEnv) {
+			return [[NSString stringWithUTF8String: pathEnv] stringByExpandingTildeInPath];
+		}
+
+		NSArray<NSString*>* cacheDirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+		NSString* cacheRoot = cacheDirs.count ? cacheDirs[0] : [NSHomeDirectory() stringByAppendingPathComponent: @"Library/Caches"];
+		uint64_t registryID = 0;
+#if MVK_MACOS_OR_IOS
+		if (@available(macOS 10.13, iOS 11.0, *)) {
+			registryID = mtlDev.registryID;
+		}
+#endif
+		NSString* deviceDir = registryID ? [NSString stringWithFormat: @"%016llx", (unsigned long long)registryID] : @"default";
+		return [[[[cacheRoot stringByAppendingPathComponent: @"MoltenVK"]
+							  stringByAppendingPathComponent: @"DetroitBinaryArchive"]
+							 stringByAppendingPathComponent: deviceDir]
+							stringByAppendingPathComponent: @"archive.bin"];
+	}
+
+	void createArchiveDirectory() {
+		NSString* dirPath = [_archivePath stringByDeletingLastPathComponent];
+		NSError* err = nil;
+		if ( ![[NSFileManager defaultManager] createDirectoryAtPath: dirPath withIntermediateDirectories: YES attributes: nil error: &err] ) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("failed to create archive directory %s: %s", dirPath.UTF8String, errorString(err));
+		}
+	}
+
+	void markAttached(const char* pipelineType) {
+		uint64_t attachCount = 0;
+		{
+			lock_guard<mutex> lock(_lock);
+			if (strcmp(pipelineType, "render") == 0) {
+				attachCount = ++_renderAttachCount;
+			} else {
+				attachCount = ++_computeAttachCount;
+			}
+		}
+		if (_verbose || attachCount == 1) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("attached archive to %s pipeline descriptor, attach count = %llu", pipelineType, (unsigned long long)attachCount);
+		}
+	}
+
+	void markDirty(const char* pipelineType) {
+		uint64_t pipelineCount = 0;
+		bool shouldSerialize = false;
+		{
+			lock_guard<mutex> lock(_lock);
+			pipelineCount = ++_addedPipelineCount;
+			_dirty = true;
+			shouldSerialize = (_addedPipelineCount - _lastSerializedPipelineCount) >= MVK_DTR_BINARY_ARCHIVE_SERIALIZE_INTERVAL;
+		}
+		if (_verbose || pipelineCount == 1) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("added %s pipeline to archive, pipeline count = %llu", pipelineType, (unsigned long long)pipelineCount);
+		}
+		if (shouldSerialize) {
+			serialize();
+		}
+	}
+
+	void serializeLocked() {
+		if ( !_archive || !_archiveURL || !_dirty ) { return; }
+
+		createArchiveDirectory();
+		NSError* err = nil;
+		if ([_archive serializeToURL: _archiveURL error: &err]) {
+			_lastSerializedPipelineCount = _addedPipelineCount;
+			_dirty = false;
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("serialize success, pipeline count = %llu, path = %s", (unsigned long long)_addedPipelineCount, _archivePath.UTF8String);
+		} else {
+			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("serialize failed: %s", errorString(err));
+		}
+	}
+
+	void logAddFailure(const char* pipelineType, NSError* err) {
+		uint64_t addFailureCount = 0;
+		{
+			lock_guard<mutex> lock(_lock);
+			addFailureCount = ++_addFailureCount;
+		}
+		if (_verbose || addFailureCount == 1) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("add %s pipeline failed: %s", pipelineType, errorString(err));
+		}
+	}
+
+	void logSkippedAdd(const char* pipelineType) {
+		uint64_t skippedAddCount = 0;
+		{
+			lock_guard<mutex> lock(_lock);
+			skippedAddCount = ++_skippedAddCount;
+		}
+		if (_verbose || skippedAddCount == 1) {
+			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("skipping some %s archive population under concurrent pipeline compilation", pipelineType);
+		}
+	}
+
+	void logUnavailableOnce() {
+		lock_guard<mutex> lock(_lock);
+		if (_unavailableLogged) { return; }
+		MVK_DTR_BINARY_ARCHIVE_LOG_WARN("unavailable on this OS, disabled");
+		_unavailableLogged = true;
+	}
+
+	const char* errorString(NSError* err) {
+		return err.localizedDescription.UTF8String ?: "unknown error";
+	}
+
+	mutex _lock;
+	mutex _archiveAddLock;
+	id<MTLBinaryArchive> _archive = nil;
+	id<MTLDevice> _mtlDevice = nil;
+	NSURL* _archiveURL = nil;
+	NSString* _archivePath = nil;
+	uint64_t _renderAttachCount = 0;
+	uint64_t _computeAttachCount = 0;
+	uint64_t _addedPipelineCount = 0;
+	uint64_t _lastSerializedPipelineCount = 0;
+	uint64_t _addFailureCount = 0;
+	uint64_t _skippedAddCount = 0;
+	bool _enabled = false;
+	bool _enableRender = false;
+	bool _enableCompute = false;
+	bool _populate = true;
+	bool _verbose = false;
+	bool _dirty = false;
+	bool _creationAttempted = false;
+	bool _deviceMismatchLogged = false;
+	bool _renderAttachDisabled = false;
+	bool _renderRetryLogged = false;
+	bool _computeAttachDisabled = false;
+	bool _computeRetryLogged = false;
+	bool _unavailableLogged = false;
+};
 
 
 #pragma mark - MVKPipelineLayout
@@ -1000,6 +1593,12 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPi
 		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
 		plState = plc->newMTLRenderPipelineState(plDesc);	// retained
 		plc->destroy();
+		if ( !plState && MVKDTRBinaryArchiveManager::get().retryRenderWithoutArchive(plDesc) ) {
+			clearConfigurationResult();
+			plc = new MVKRenderPipelineCompiler(this);
+			plState = plc->newMTLRenderPipelineState(plDesc);	// retained
+			plc->destroy();
+		}
 		if ( !plState ) { _hasValidMTLPipelineStates = false; }
 	}
 	return plState;
@@ -1013,6 +1612,12 @@ id<MTLComputePipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLCompute
 		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this, compilerType);
 		plState = plc->newMTLComputePipelineState(plDesc);	// retained
 		plc->destroy();
+		if ( !plState && MVKDTRBinaryArchiveManager::get().retryComputeWithoutArchive(plDesc) ) {
+			clearConfigurationResult();
+			plc = new MVKComputePipelineCompiler(this, compilerType);
+			plState = plc->newMTLComputePipelineState(plDesc);	// retained
+			plc->destroy();
+		}
 		if ( !plState ) { _hasValidMTLPipelineStates = false; }
 	}
 	return plState;
@@ -2175,7 +2780,7 @@ void MVKGraphicsPipeline::initShaderConversionConfig(SPIRVToMSLConversionConfigu
 	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
 	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
 	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
-	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
+	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff && !mvkDTRArgumentBufferNoPaddingEnabled();
 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)getMetalFeatures().argumentBuffersTier;
 	shaderConfig.options.mslOptions.agx_manual_cube_grad_fixup = mtlFeats.needsCubeGradWorkaround;
 
@@ -2586,6 +3191,12 @@ MVKComputePipeline::MVKComputePipeline(MVKDevice* device,
 		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
 		_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
 		plc->destroy();
+		if ( !_mtlPipelineState && MVKDTRBinaryArchiveManager::get().retryComputeWithoutArchive(plDesc) ) {
+			clearConfigurationResult();
+			plc = new MVKComputePipelineCompiler(this);
+			_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
+			plc->destroy();
+		}
 		[plDesc release];															// temp release
 
 		if ( !_mtlPipelineState ) { _hasValidMTLPipelineStates = false; }
@@ -2628,7 +3239,7 @@ MVKMTLFunction MVKComputePipeline::getMTLFunction(const VkComputePipelineCreateI
 	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
 	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
 	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
-	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
+	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff && !mvkDTRArgumentBufferNoPaddingEnabled();
 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)getMetalFeatures().argumentBuffersTier;
 
 #if MVK_MACOS
@@ -2685,16 +3296,70 @@ MVKComputePipeline::~MVKComputePipeline() {
 
 // Return a shader library from the specified shader conversion configuration sourced from the specified shader module.
 MVKShaderLibrary* MVKPipelineCache::getShaderLibrary(SPIRVToMSLConversionConfiguration* pContext,
-													 MVKShaderModule* shaderModule,
-													 MVKPipeline* pipeline,
-													 VkPipelineCreationFeedback* pShaderFeedback,
-													 uint64_t startTime) {
+											 MVKShaderModule* shaderModule,
+											 MVKPipeline* pipeline,
+											 VkPipelineCreationFeedback* pShaderFeedback,
+										 uint64_t startTime) {
 	if (_isExternallySynchronized) {
 		return getShaderLibraryImpl(pContext, shaderModule, pipeline, pShaderFeedback, startTime);
-	} else {
+	}
+	if ( !mvkDTRShaderCacheConcurrentCompileEnabled() ) {
 		lock_guard<mutex> lock(_shaderCacheLock);
 		return getShaderLibraryImpl(pContext, shaderModule, pipeline, pShaderFeedback, startTime);
 	}
+
+	MVKDTRShaderCacheDiagnostics& diag = MVKDTRShaderCacheDiagnostics::get();
+	MVKShaderModuleKey smKey = shaderModule->getKey();
+	MVKShaderLibraryCache* slCache = nullptr;
+	MVKShaderLibrary* shLib = nullptr;
+	SPIRVToMSLConversionResult conversionResult;
+
+	uint64_t lockStart = mvkGetTimestamp();
+	unique_lock<mutex> lock(_shaderCacheLock);
+	diag.recordLockWait(mvkGetElapsedNanoseconds(lockStart));
+
+	slCache = getShaderLibraryCache(smKey);
+	shLib = slCache->findShaderLibrary(pContext, pShaderFeedback, startTime);
+	if (shLib) {
+		diag.recordHit(smKey, pContext);
+		if (pShaderFeedback) { mvkEnableFlags(pShaderFeedback->flags, VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT); }
+		return shLib;
+	}
+
+	diag.recordMiss(smKey, pContext, slCache->_shaderLibraries.size());
+	if (pipeline->shouldFailOnPipelineCompileRequired()) {
+		diag.recordCompileSkipped(smKey, pContext);
+		return nullptr;
+	}
+
+	// Convert under the cache lock because MVKShaderModule's SPIR-V converter is not guarded here.
+	// Metal source compilation below is much more expensive and can safely happen outside the lock.
+	if ( !shaderModule->convert(pContext, conversionResult) ) { return nullptr; }
+	lock.unlock();
+
+	uint64_t compileStart = mvkGetTimestamp();
+	MVKShaderLibrary* newShLib = new MVKShaderLibrary(slCache->_owner, conversionResult);
+	uint64_t compileNanos = mvkGetElapsedNanoseconds(compileStart);
+
+	lockStart = mvkGetTimestamp();
+	lock.lock();
+	diag.recordLockWait(mvkGetElapsedNanoseconds(lockStart));
+
+	// Another pipeline creation thread might have populated this shader while Metal was compiling.
+	slCache = getShaderLibraryCache(smKey);
+	shLib = slCache->findShaderLibrary(pContext);
+	if (shLib) {
+		newShLib->destroy();
+		diag.recordDuplicate(smKey, pContext, compileNanos);
+		if (pShaderFeedback) { pShaderFeedback->duration += mvkGetElapsedNanoseconds(startTime); }
+		return shLib;
+	}
+
+	slCache->_shaderLibraries.emplace_back(*pContext, newShLib);
+	markDirty();
+	if (pShaderFeedback) { pShaderFeedback->duration += mvkGetElapsedNanoseconds(startTime); }
+	diag.recordCompiled(smKey, pContext, compileNanos, slCache->_shaderLibraries.size());
+	return newShLib;
 }
 
 MVKShaderLibrary* MVKPipelineCache::getShaderLibraryImpl(SPIRVToMSLConversionConfiguration* pContext,
@@ -3212,6 +3877,9 @@ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(
 
 	compile(lock, ^{
 		auto mtlDev = getMTLDevice();
+		if (_owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
+			MVKDTRBinaryArchiveManager::get().attach(mtlRPLDesc, mtlDev);
+		}
 		@synchronized (mtlDev) {
 			[mtlDev newRenderPipelineStateWithDescriptor: mtlRPLDesc
 									   completionHandler: ^(id<MTLRenderPipelineState> ps, NSError* error) {
@@ -3221,7 +3889,12 @@ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(
 		}
 	});
 
-	return [_mtlRenderPipelineState retain];
+	id<MTLRenderPipelineState> mtlRenderPipelineState = [_mtlRenderPipelineState retain];
+	lock.unlock();
+	if (mtlRenderPipelineState && _owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
+		MVKDTRBinaryArchiveManager::get().add(mtlRPLDesc, getMTLDevice());
+	}
+	return mtlRenderPipelineState;
 }
 
 bool MVKRenderPipelineCompiler::compileComplete(id<MTLRenderPipelineState> mtlRenderPipelineState, NSError* compileError) {
@@ -3246,6 +3919,9 @@ id<MTLComputePipelineState> MVKComputePipelineCompiler::newMTLComputePipelineSta
 
 	compile(lock, ^{
 		auto mtlDev = getMTLDevice();
+		if (_owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
+			MVKDTRBinaryArchiveManager::get().attach(plDesc, mtlDev);
+		}
 		@synchronized (mtlDev) {
 			[mtlDev newComputePipelineStateWithDescriptor: plDesc
 												  options: MTLPipelineOptionNone
@@ -3256,7 +3932,12 @@ id<MTLComputePipelineState> MVKComputePipelineCompiler::newMTLComputePipelineSta
 		}
 	});
 
-	return [_mtlComputePipelineState retain];
+	id<MTLComputePipelineState> mtlComputePipelineState = [_mtlComputePipelineState retain];
+	lock.unlock();
+	if (mtlComputePipelineState && _owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
+		MVKDTRBinaryArchiveManager::get().add(plDesc, getMTLDevice());
+	}
+	return mtlComputePipelineState;
 }
 
 bool MVKComputePipelineCompiler::compileComplete(id<MTLComputePipelineState> mtlComputePipelineState, NSError* compileError) {

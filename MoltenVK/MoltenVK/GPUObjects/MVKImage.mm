@@ -25,12 +25,152 @@
 #include "MVKFoundation.h"
 #include "MVKOSExtensions.h"
 #include "MVKCodec.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <pthread.h>
 
 #import "MTLSamplerDescriptor+MoltenVK.h"
 #import "CAMetalLayer+MoltenVK.h"
 
 using namespace std;
 using namespace SPIRV_CROSS_NAMESPACE;
+
+
+static bool mvkDTRBoolEnvValue(const char* name, bool defaultValue) {
+	const char* env = getenv(name);
+	if ( !env ) { return defaultValue; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env == '0') { return false; }
+	if (*env == '1') { return true; }
+	return defaultValue;
+}
+
+static bool mvkDTRSurfaceLogEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG", false);
+}
+
+static bool mvkDTRSurfaceLogAllImagesEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG_ALL_IMAGES", false);
+}
+
+static bool mvkDTRSkipPresentedHandlerEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_PRESENTED_HANDLER", false);
+}
+
+static bool mvkDTRSkipDrawablePresentEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT", false);
+}
+
+static bool mvkDTRSkipDrawablePresentAfterModeSwitchEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT_AFTER_MODE_SWITCH", false);
+}
+
+static bool mvkDTRLeakPresentCompletionObjectsEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_LEAK_PRESENT_COMPLETION_OBJECTS", false);
+}
+
+static bool mvkDTRRetainDrawableUntilPresentedEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_RETAIN_DRAWABLE_UNTIL_PRESENTED", true);
+}
+
+static bool mvkDTRSkipPresentCompletedHandlerEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_PRESENT_COMPLETED_HANDLER", false);
+}
+
+static bool mvkDTRSkipPresentScheduledHandlerEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_PRESENT_SCHEDULED_HANDLER", false);
+}
+
+static bool mvkDTRCatchImageMemoryDtorExceptionsEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_CATCH_IMAGE_MEMORY_DTOR_EXCEPTIONS", false);
+}
+
+static uint64_t mvkDTRCurrentThreadID() {
+	uint64_t tid = 0;
+	pthread_threadid_np(pthread_self(), &tid);
+	return tid;
+}
+
+static uint32_t mvkDTRUIntEnvValue(const char* name) {
+	const char* env = getenv(name);
+	if ( !env ) { return 0; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	char* end = nullptr;
+	unsigned long val = strtoul(env, &end, 10);
+	while (end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) { end++; }
+	return (end && *end == '\0') ? (uint32_t)val : 0;
+}
+
+static bool mvkDTRShouldSkipDrawablePresent(VkExtent2D extent) {
+	if (mvkDTRSkipDrawablePresentEnabled()) { return true; }
+	if ( !mvkDTRSkipDrawablePresentAfterModeSwitchEnabled() ) { return false; }
+
+	static mutex extentLock;
+	static bool hasExtent = false;
+	static uint32_t lastWidth = 0;
+	static uint32_t lastHeight = 0;
+	static bool sawModeSwitch = false;
+	lock_guard<mutex> lock(extentLock);
+
+	if ( !extent.width || !extent.height ) { return false; }
+	if ( !hasExtent ) {
+		hasExtent = true;
+		lastWidth = extent.width;
+		lastHeight = extent.height;
+		return false;
+	}
+	if (extent.width != lastWidth || extent.height != lastHeight) {
+		sawModeSwitch = true;
+		lastWidth = extent.width;
+		lastHeight = extent.height;
+	}
+
+	uint32_t minWidth = mvkDTRUIntEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT_MIN_WIDTH");
+	uint32_t minHeight = mvkDTRUIntEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT_MIN_HEIGHT");
+	return sawModeSwitch && extent.width >= minWidth && extent.height >= minHeight;
+}
+
+static NSString* mvkDTRSurfaceLogPath() {
+	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	return @"/tmp/mvk-dtr-surface.log";
+}
+
+static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
+static void mvkDTRSurfaceLog(const char* fmt, ...) {
+	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
+
+	char msg[2048];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+
+	static mutex logLock;
+	lock_guard<mutex> lock(logLock);
+	@autoreleasepool {
+		NSString* logPath = mvkDTRSurfaceLogPath();
+		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
+		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
+		if ( !logFile ) { return; }
+		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
+		fprintf(logFile, "%s MVK-DTR-IMAGE tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
+		fclose(logFile);
+	}
+}
+
+static bool mvkDTRShouldLogSwapchainImage(MVKSwapchain* swapchain) {
+	if ( !mvkDTRSurfaceLogEnabled() || !swapchain ) { return false; }
+	if ( mvkDTRSurfaceLogAllImagesEnabled() ) { return true; }
+	VkExtent2D extent = swapchain->getImageExtent();
+	return extent.width >= 3000 || extent.height >= 1500;
+}
 
 #pragma mark -
 #pragma mark MVKImagePlane
@@ -600,12 +740,60 @@ MVKImageMemoryBinding::MVKImageMemoryBinding(MVKDevice* device, MVKImage* image,
 }
 
 MVKImageMemoryBinding::~MVKImageMemoryBinding() {
-	if (_deviceMemory) { MVKDeviceMemory::removeImageMemoryBinding(&_deviceMemory, this); }
-	if (_ownsTexelBuffer) {
-		_device->removeResidency(_mtlTexelBuffer);
-		_device->getLiveResources().remove(_mtlTexelBuffer);
-		[_mtlTexelBuffer release];
+	bool catchExceptions = mvkDTRCatchImageMemoryDtorExceptionsEnabled();
+	mvkDTRSurfaceLog("image memory binding dtor begin binding=%p image=%p plane=%u memory=%p owns_texel=%u texel=%p offset=%llu bytes=%llu catch=%u",
+					 this, _image, _planeIndex, _deviceMemory, _ownsTexelBuffer ? 1 : 0, _mtlTexelBuffer,
+					 (unsigned long long)_mtlTexelBufferOffset, (unsigned long long)_byteCount, catchExceptions ? 1 : 0);
+	if (_deviceMemory) {
+		mvkDTRSurfaceLog("image memory binding dtor remove memory begin binding=%p memory=%p", this, _deviceMemory);
+		MVKDeviceMemory::removeImageMemoryBinding(&_deviceMemory, this);
+		mvkDTRSurfaceLog("image memory binding dtor remove memory end binding=%p memory=%p", this, _deviceMemory);
 	}
+	if (_ownsTexelBuffer) {
+		if (catchExceptions) {
+			@try {
+				mvkDTRSurfaceLog("image memory binding dtor remove residency begin binding=%p texel=%p", this, _mtlTexelBuffer);
+				_device->removeResidency(_mtlTexelBuffer);
+				mvkDTRSurfaceLog("image memory binding dtor remove residency end binding=%p texel=%p", this, _mtlTexelBuffer);
+			} @catch (NSException* ex) {
+				NSString* exName = ex.name ?: @"";
+				NSString* exReason = ex.reason ?: @"";
+				mvkDTRSurfaceLog("image memory binding dtor remove residency exception binding=%p texel=%p name=%s reason=%s",
+								 this, _mtlTexelBuffer, exName.UTF8String, exReason.UTF8String);
+			}
+			@try {
+				mvkDTRSurfaceLog("image memory binding dtor live remove begin binding=%p texel=%p", this, _mtlTexelBuffer);
+				_device->getLiveResources().remove(_mtlTexelBuffer);
+				mvkDTRSurfaceLog("image memory binding dtor live remove end binding=%p texel=%p", this, _mtlTexelBuffer);
+			} @catch (NSException* ex) {
+				NSString* exName = ex.name ?: @"";
+				NSString* exReason = ex.reason ?: @"";
+				mvkDTRSurfaceLog("image memory binding dtor live remove exception binding=%p texel=%p name=%s reason=%s",
+								 this, _mtlTexelBuffer, exName.UTF8String, exReason.UTF8String);
+			}
+			@try {
+				mvkDTRSurfaceLog("image memory binding dtor texel release begin binding=%p texel=%p", this, _mtlTexelBuffer);
+				[_mtlTexelBuffer release];
+				mvkDTRSurfaceLog("image memory binding dtor texel release end binding=%p texel=%p", this, _mtlTexelBuffer);
+			} @catch (NSException* ex) {
+				NSString* exName = ex.name ?: @"";
+				NSString* exReason = ex.reason ?: @"";
+				mvkDTRSurfaceLog("image memory binding dtor texel release exception binding=%p texel=%p name=%s reason=%s",
+								 this, _mtlTexelBuffer, exName.UTF8String, exReason.UTF8String);
+			}
+		} else {
+			mvkDTRSurfaceLog("image memory binding dtor remove residency begin binding=%p texel=%p", this, _mtlTexelBuffer);
+			_device->removeResidency(_mtlTexelBuffer);
+			mvkDTRSurfaceLog("image memory binding dtor remove residency end binding=%p texel=%p", this, _mtlTexelBuffer);
+			mvkDTRSurfaceLog("image memory binding dtor live remove begin binding=%p texel=%p", this, _mtlTexelBuffer);
+			_device->getLiveResources().remove(_mtlTexelBuffer);
+			mvkDTRSurfaceLog("image memory binding dtor live remove end binding=%p texel=%p", this, _mtlTexelBuffer);
+			mvkDTRSurfaceLog("image memory binding dtor texel release begin binding=%p texel=%p", this, _mtlTexelBuffer);
+			[_mtlTexelBuffer release];
+			mvkDTRSurfaceLog("image memory binding dtor texel release end binding=%p texel=%p", this, _mtlTexelBuffer);
+		}
+	}
+	mvkDTRSurfaceLog("image memory binding dtor end binding=%p image=%p", this, _image);
 }
 
 
@@ -1465,9 +1653,24 @@ void MVKImage::initExternalMemory(VkExternalMemoryHandleTypeFlags handleTypes) {
 }
 
 MVKImage::~MVKImage() {
+	mvkDTRSurfaceLog("image dtor begin image=%p bindings=%zu planes=%zu extent=%ux%ux%u format=%u usage=0x%x", this, _memoryBindings.size(), _planes.size(), _extent.width, _extent.height, _extent.depth, _vkFormat, _usage);
 	mvkDestroyContainerContents(_memoryBindings);
+	mvkDTRSurfaceLog("image dtor bindings destroyed image=%p", this);
 	mvkDestroyContainerContents(_planes);
+	mvkDTRSurfaceLog("image dtor planes destroyed image=%p", this);
     releaseIOSurface();
+	mvkDTRSurfaceLog("image dtor end image=%p", this);
+}
+
+void MVKImage::destroy() {
+	detachMemory();
+	MVKVulkanAPIDeviceObject::destroy();
+}
+
+void MVKImage::detachMemory() {
+	for (auto& memoryBinding : _memoryBindings) {
+		if (memoryBinding->_deviceMemory) { MVKDeviceMemory::removeImageMemoryBinding(&memoryBinding->_deviceMemory, memoryBinding); }
+	}
 }
 
 
@@ -1540,6 +1743,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
 }
 
 VkResult MVKPresentableSwapchainImage::acquireAndSignalWhenAvailable(MVKSemaphore* semaphore, MVKFence* fence) {
+	if (mvkDTRShouldLogSwapchainImage(_swapchain)) {
+		VkExtent2D extent = _swapchain->getImageExtent();
+		mvkDTRSurfaceLog("acquire image begin image=%p swapchain=%p index=%u extent=%ux%u drawable=%p available=%u sem=%p fence=%p",
+						 this, _swapchain, _swapchainIndex, extent.width, extent.height, _mtlDrawable, _availability.isAvailable ? 1 : 0, semaphore, fence);
+	}
 
 	// Now that this image is being acquired, release the existing drawable and its texture.
 	// This is not done earlier so the texture is retained for any post-processing such as screen captures, etc.
@@ -1576,7 +1784,12 @@ VkResult MVKPresentableSwapchainImage::acquireAndSignalWhenAvailable(MVKSemaphor
 	}
 	track(signaler);
 
-	return getConfigurationResult();
+	VkResult rslt = getConfigurationResult();
+	if (mvkDTRShouldLogSwapchainImage(_swapchain)) {
+		mvkDTRSurfaceLog("acquire image end image=%p swapchain=%p index=%u result=%d available=%u pending_signalers=%zu",
+						 this, _swapchain, _swapchainIndex, rslt, _availability.isAvailable ? 1 : 0, _availabilitySignalers.size());
+	}
+	return rslt;
 }
 
 // Calling nextDrawable may result in a nil drawable, or a drawable with no pixel format.
@@ -1590,11 +1803,24 @@ id<CAMetalDrawable> MVKPresentableSwapchainImage::getCAMetalDrawable() {
 		@autoreleasepool {
 			bool hasInvalidFormat = false;
 			uint32_t attemptCnt = _swapchain->getImageCount();	// Attempt a resonable number of times
+			if (mvkDTRShouldLogSwapchainImage(_swapchain)) {
+				VkExtent2D extent = _swapchain->getImageExtent();
+				CAMetalLayer* layer = _swapchain->getCAMetalLayer();
+				mvkDTRSurfaceLog("nextDrawable begin image=%p swapchain=%p index=%u extent=%ux%u layer=%p attempts=%u",
+							 this, _swapchain, _swapchainIndex, extent.width, extent.height, layer, attemptCnt);
+			}
 			for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
 				uint64_t startTime = getPerformanceTimestamp();
 				_mtlDrawable = [_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
 				addPerformanceInterval(getPerformanceStats().queue.retrieveCAMetalDrawable, startTime);
 				hasInvalidFormat = _mtlDrawable && !_mtlDrawable.texture.pixelFormat;
+				if (mvkDTRShouldLogSwapchainImage(_swapchain)) {
+					id<MTLTexture> tex = _mtlDrawable.texture;
+					mvkDTRSurfaceLog("nextDrawable attempt image=%p swapchain=%p index=%u attempt=%u drawable=%p texture=%p tex_size=%zux%zu pixfmt=%llu invalid_format=%u elapsed_us=%.1f",
+								 this, _swapchain, _swapchainIndex, attemptIdx + 1, _mtlDrawable, tex, tex ? tex.width : 0, tex ? tex.height : 0,
+								 tex ? (unsigned long long)tex.pixelFormat : 0ULL, hasInvalidFormat ? 1 : 0,
+								 (double)getPerformanceTimestamp() - (double)startTime);
+				}
 				if (hasInvalidFormat) { releaseMetalDrawable(); }
 			}
 			if (hasInvalidFormat) {
@@ -1615,7 +1841,18 @@ id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
 // Present the drawable and make myself available only once the command buffer has completed.
 // Pass MVKImagePresentInfo by value because it may not exist when the callback runs.
 VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
-															  MVKImagePresentInfo presentInfo) {
+											  MVKImagePresentInfo presentInfo) {
+	bool shouldLog = mvkDTRShouldLogSwapchainImage(_swapchain);
+	auto* loggedImage = this;
+	auto* loggedSwapchain = _swapchain;
+	uint32_t loggedIndex = _swapchainIndex;
+	VkExtent2D loggedExtent = {0, 0};
+	if (loggedSwapchain) { loggedExtent = loggedSwapchain->getImageExtent(); }
+	if (shouldLog) {
+		mvkDTRSurfaceLog("present begin image=%p swapchain=%p index=%u extent=%ux%u cmd=%p present_mode=%u present_id=%llu",
+						 loggedImage, loggedSwapchain, loggedIndex, loggedExtent.width, loggedExtent.height, mtlCmdBuff,
+						 presentInfo.presentMode, (unsigned long long)presentInfo.presentId);
+	}
 	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
 
 	// According to Apple, it is more performant to call MTLDrawable present from within a
@@ -1623,22 +1860,51 @@ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffe
 	// But get current drawable now, intead of in handler, because a new drawable might be acquired by then.
 	// Attach present handler before presenting to avoid race condition.
 	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
+	if (shouldLog) {
+		id<MTLTexture> tex = mtlDrwbl.texture;
+		mvkDTRSurfaceLog("present drawable image=%p swapchain=%p index=%u drawable=%p layer=%p texture=%p tex_size=%zux%zu pixfmt=%llu",
+						 loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl, mtlDrwbl.layer, tex, tex ? tex.width : 0, tex ? tex.height : 0,
+						 tex ? (unsigned long long)tex.pixelFormat : 0ULL);
+	}
 	MVKSwapchainSignaler signaler = getPresentationSignaler();
-	[mtlCmdBuff addScheduledHandler: ^(id<MTLCommandBuffer> mcb) {
-
-		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
-
-		// Try to do any present mode transitions as late as possible in an attempt
-		// to avoid visual disruptions on any presents already on the queue.
-		if (presentInfo.presentMode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
-			mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
+	bool skipPresentedHandler = mvkDTRSkipPresentedHandlerEnabled();
+	bool skipDrawablePresent = mvkDTRShouldSkipDrawablePresent(loggedExtent);
+	bool leakPresentCompletionObjects = mvkDTRLeakPresentCompletionObjectsEnabled();
+	bool skipPresentCompletedHandler = skipDrawablePresent && mvkDTRSkipPresentCompletedHandlerEnabled();
+	bool skipPresentScheduledHandler = skipDrawablePresent && mvkDTRSkipPresentScheduledHandlerEnabled();
+	if (skipPresentScheduledHandler) {
+		if (shouldLog) { mvkDTRSurfaceLog("present scheduled handler add skipped image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl); }
+	} else {
+		[mtlCmdBuff addScheduledHandler: ^(id<MTLCommandBuffer> mcb) {
+		if (shouldLog) {
+			mvkDTRSurfaceLog("present scheduled image=%p swapchain=%p index=%u extent=%ux%u cmd=%p status=%lu drawable=%p layer=%p",
+							 loggedImage, loggedSwapchain, loggedIndex, loggedExtent.width, loggedExtent.height, mcb,
+							 (unsigned long)mcb.status, mtlDrwbl, mtlDrwbl.layer);
 		}
-		if (presentInfo.desiredPresentTime) {
-			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
+
+		if (skipPresentedHandler) {
+			if (shouldLog) { mvkDTRSurfaceLog("presented handler skipped image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl); }
+			beginPresentation(presentInfo);
 		} else {
-			[mtlDrwbl present];
+			addPresentedHandler(mtlDrwbl, presentInfo, signaler);
 		}
-	}];
+
+		if (skipDrawablePresent) {
+			if (shouldLog) { mvkDTRSurfaceLog("drawable present skipped image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl); }
+		} else {
+			// Try to do any present mode transitions as late as possible in an attempt
+			// to avoid visual disruptions on any presents already on the queue.
+			if (presentInfo.presentMode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
+				mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
+			}
+			if (presentInfo.desiredPresentTime) {
+				[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
+			} else {
+				[mtlDrwbl present];
+			}
+		}
+		}];
+	}
 
 	// Ensure this image, the drawable, and the present fence are not destroyed while
 	// awaiting MTLCommandBuffer completion. We retain the drawable separately because
@@ -1650,13 +1916,57 @@ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffe
 	[mtlDrwbl retain];
 	auto* fence = presentInfo.fence;
 	if (fence) { fence->retain(); }
-	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
+	if (skipPresentCompletedHandler) {
+		if (shouldLog) { mvkDTRSurfaceLog("present completed handler add skipped image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl); }
+	} else {
+		[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
+		if (shouldLog) {
+			NSString* errDesc = mcb.error.localizedDescription ?: @"";
+			mvkDTRSurfaceLog("present completed image=%p swapchain=%p index=%u extent=%ux%u cmd=%p status=%lu error=%s drawable=%p",
+							 loggedImage, loggedSwapchain, loggedIndex, loggedExtent.width, loggedExtent.height, mcb,
+							 (unsigned long)mcb.status, errDesc.UTF8String, mtlDrwbl);
+		}
+		if (skipPresentedHandler) {
+			if (shouldLog) { mvkDTRSurfaceLog("present completed synthetic presentation begin image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
+			endPresentation(presentInfo, signaler);
+			if (shouldLog) { mvkDTRSurfaceLog("present completed synthetic presentation end image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
+		}
+		if (shouldLog) { mvkDTRSurfaceLog("present completed fence signal begin image=%p swapchain=%p index=%u fence=%p", loggedImage, loggedSwapchain, loggedIndex, fence); }
 		signal(fence);
-		if (fence) { fence->release(); }
-		[mtlDrwbl release];
-		release();
-		if (_swapchain) { _swapchain->notifyPresentComplete(presentInfo); }
-	}];
+		if (fence) {
+			if (leakPresentCompletionObjects) {
+				if (shouldLog) { mvkDTRSurfaceLog("present completed fence release skipped leak image=%p swapchain=%p index=%u fence=%p", loggedImage, loggedSwapchain, loggedIndex, fence); }
+			} else {
+				fence->release();
+			}
+		}
+		if (shouldLog) { mvkDTRSurfaceLog("present completed fence signal end image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
+		{
+			lock_guard<mutex> lock(_detachmentLock);
+			if (_swapchain) {
+				if (shouldLog) { mvkDTRSurfaceLog("present completed notify begin image=%p swapchain=%p index=%u", loggedImage, _swapchain, loggedIndex); }
+				_swapchain->notifyPresentComplete(presentInfo);
+				if (shouldLog) { mvkDTRSurfaceLog("present completed notify end image=%p swapchain=%p index=%u", loggedImage, _swapchain, loggedIndex); }
+			} else if (shouldLog) {
+				mvkDTRSurfaceLog("present completed notify skipped detached image=%p logged_swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex);
+			}
+		}
+		if (shouldLog) { mvkDTRSurfaceLog("present completed drawable release begin image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl); }
+		if (leakPresentCompletionObjects) {
+			if (shouldLog) { mvkDTRSurfaceLog("present completed drawable release skipped leak image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl); }
+		} else {
+			[mtlDrwbl release];
+			if (shouldLog) { mvkDTRSurfaceLog("present completed drawable release end image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
+		}
+		if (shouldLog) { mvkDTRSurfaceLog("present completed image release begin image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
+		if (leakPresentCompletionObjects) {
+			if (shouldLog) { mvkDTRSurfaceLog("present completed image release skipped leak image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
+		} else {
+			release();
+			if (shouldLog) { mvkDTRSurfaceLog("present completed image release end image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
+		}
+		}];
+	}
 
 	signal(signaler.semaphore, signaler.semaphoreSignalToken, mtlCmdBuff);
 
@@ -1687,23 +1997,54 @@ MVKSwapchainSignaler MVKPresentableSwapchainImage::getPresentationSignaler() {
 
 // Pass MVKImagePresentInfo & MVKSwapchainSignaler by value because they may not exist when the callback runs.
 void MVKPresentableSwapchainImage::addPresentedHandler(id<CAMetalDrawable> mtlDrawable,
-													   MVKImagePresentInfo presentInfo,
-													   MVKSwapchainSignaler signaler) {
+											   MVKImagePresentInfo presentInfo,
+											   MVKSwapchainSignaler signaler) {
+	bool shouldLog = mvkDTRShouldLogSwapchainImage(_swapchain);
+	auto* loggedImage = this;
+	auto* loggedSwapchain = _swapchain;
+	uint32_t loggedIndex = _swapchainIndex;
+	VkExtent2D loggedExtent = {0, 0};
+	if (loggedSwapchain) { loggedExtent = loggedSwapchain->getImageExtent(); }
+	bool retainDrawableUntilPresented = mvkDTRRetainDrawableUntilPresentedEnabled();
 	beginPresentation(presentInfo);
+	if (retainDrawableUntilPresented) {
+		[mtlDrawable retain];
+		if (shouldLog) { mvkDTRSurfaceLog("presented handler retain drawable image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrawable); }
+	}
 
 #if !MVK_OS_SIMULATOR
 	[mtlDrawable addPresentedHandler: ^(id<MTLDrawable> mtlDrwbl) {
+		if (shouldLog) {
+			mvkDTRSurfaceLog("presented handler begin image=%p swapchain=%p index=%u extent=%ux%u drawable=%p presented_time=%.9f",
+						 loggedImage, loggedSwapchain, loggedIndex, loggedExtent.width, loggedExtent.height,
+						 mtlDrwbl, mtlDrwbl.presentedTime);
+		}
 		endPresentation(presentInfo, signaler, mtlDrwbl.presentedTime * 1.0e9);
+		if (retainDrawableUntilPresented) {
+			if (shouldLog) { mvkDTRSurfaceLog("presented handler release retained drawable image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrwbl); }
+			[mtlDrwbl release];
+		}
+		if (shouldLog) { mvkDTRSurfaceLog("presented handler end image=%p swapchain=%p index=%u", loggedImage, loggedSwapchain, loggedIndex); }
 	}];
 #else
 	// If MTLDrawable.presentedTime/addPresentedHandler isn't supported,
 	// treat it as if the present happened when requested.
 	endPresentation(presentInfo, signaler);
+	if (retainDrawableUntilPresented) {
+		if (shouldLog) { mvkDTRSurfaceLog("presented handler simulator release retained drawable image=%p swapchain=%p index=%u drawable=%p", loggedImage, loggedSwapchain, loggedIndex, mtlDrawable); }
+		[mtlDrawable release];
+	}
 #endif
 }
 
 // Ensure this image and the swapchain are not destroyed while awaiting presentation
 void MVKPresentableSwapchainImage::beginPresentation(const MVKImagePresentInfo& presentInfo) {
+	if (mvkDTRShouldLogSwapchainImage(_swapchain)) {
+		VkExtent2D extent = _swapchain->getImageExtent();
+		mvkDTRSurfaceLog("presentation begin image=%p swapchain=%p index=%u extent=%ux%u present_mode=%u present_id=%llu",
+						 this, _swapchain, _swapchainIndex, extent.width, extent.height,
+						 presentInfo.presentMode, (unsigned long long)presentInfo.presentId);
+	}
 	retain();
 	_swapchain->beginPresentation(presentInfo);
 	_beginPresentTime = mvkGetRuntimeNanoseconds();
@@ -1711,9 +2052,8 @@ void MVKPresentableSwapchainImage::beginPresentation(const MVKImagePresentInfo& 
 }
 
 void MVKPresentableSwapchainImage::endPresentation(const MVKImagePresentInfo& presentInfo,
-												   const MVKSwapchainSignaler& signaler,
-												   uint64_t actualPresentTime) {
-
+									   const MVKSwapchainSignaler& signaler,
+									   uint64_t actualPresentTime) {
 	// If the presentation time is not available, use the current nanosecond runtime clock,
 	// which should be reasonably accurate (sub-ms) to the presentation time. The presentation
 	// time will not be available if the presentation did not actually happen, such as when
@@ -1724,19 +2064,50 @@ void MVKPresentableSwapchainImage::endPresentation(const MVKImagePresentInfo& pr
 		// If I have become detached from the swapchain, it means the swapchain, and possibly the
 		// VkDevice, have been destroyed by the time of this callback, so do not reference them.
 		lock_guard<mutex> lock(_detachmentLock);
+		if (mvkDTRShouldLogSwapchainImage(_swapchain)) {
+			VkExtent2D extent = _swapchain->getImageExtent();
+			mvkDTRSurfaceLog("presentation end image=%p swapchain=%p index=%u extent=%ux%u present_id=%llu actual_time=%llu sem=%p fence=%p",
+							 this, _swapchain, _swapchainIndex, extent.width, extent.height,
+							 (unsigned long long)presentInfo.presentId, (unsigned long long)actualPresentTime,
+							 signaler.semaphore, signaler.fence);
+		}
 		if (_device) { addPerformanceInterval(getPerformanceStats().queue.presentSwapchains, _presentationStartTime); }
-		if (_swapchain) { _swapchain->endPresentation(presentInfo, _beginPresentTime, actualPresentTime); }
+		if (_swapchain) {
+			_swapchain->endPresentation(presentInfo, _beginPresentTime, actualPresentTime);
+			if (mvkDTRShouldLogSwapchainImage(_swapchain)) {
+				mvkDTRSurfaceLog("presentation end swapchain returned image=%p swapchain=%p index=%u", this, _swapchain, _swapchainIndex);
+			}
+		}
 	}
 
 	// Makes an image available for acquisition by the app.
 	// If any semaphores are waiting to be signaled when this image becomes available, the
 	// earliest semaphore is signaled, and this image remains unavailable for other uses.
+	bool shouldLog = mvkDTRSurfaceLogEnabled();
+	auto* loggedImage = this;
+	uint64_t loggedPresentId = presentInfo.presentId;
+	bool leakPresentCompletionObjects = mvkDTRLeakPresentCompletionObjectsEnabled();
+	if (shouldLog) { mvkDTRSurfaceLog("presentation end signal begin image=%p present_id=%llu sem=%p fence=%p", loggedImage, (unsigned long long)loggedPresentId, signaler.semaphore, signaler.fence); }
 	signalAndUntrack(signaler);
-	release();
+	if (shouldLog) { mvkDTRSurfaceLog("presentation end signal end image=%p present_id=%llu", loggedImage, (unsigned long long)loggedPresentId); }
+	if (shouldLog) { mvkDTRSurfaceLog("presentation end image release begin image=%p present_id=%llu", loggedImage, (unsigned long long)loggedPresentId); }
+	if (leakPresentCompletionObjects) {
+		if (shouldLog) { mvkDTRSurfaceLog("presentation end image release skipped leak image=%p present_id=%llu", loggedImage, (unsigned long long)loggedPresentId); }
+	} else {
+		release();
+		if (shouldLog) { mvkDTRSurfaceLog("presentation end image release end image=%p present_id=%llu", loggedImage, (unsigned long long)loggedPresentId); }
+	}
 }
 
 // Releases the CAMetalDrawable underlying this image.
 void MVKPresentableSwapchainImage::releaseMetalDrawable() {
+	if (_mtlDrawable && mvkDTRShouldLogSwapchainImage(_swapchain)) {
+		id<MTLTexture> tex = _mtlDrawable.texture;
+		VkExtent2D extent = _swapchain->getImageExtent();
+		mvkDTRSurfaceLog("release drawable image=%p swapchain=%p index=%u extent=%ux%u drawable=%p layer=%p texture=%p tex_size=%zux%zu pixfmt=%llu",
+						 this, _swapchain, _swapchainIndex, extent.width, extent.height, _mtlDrawable, _mtlDrawable.layer, tex,
+						 tex ? tex.width : 0, tex ? tex.height : 0, tex ? (unsigned long long)tex.pixelFormat : 0ULL);
+	}
     [_mtlDrawable release];
 	_mtlDrawable = nil;
 }

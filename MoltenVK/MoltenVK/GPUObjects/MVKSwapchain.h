@@ -85,6 +85,9 @@ public:
 	/** Returns the status of the surface. Surface loss takes precedence over sub-optimal errors. */
 	VkResult getSurfaceStatus();
 
+	/** Returns the number of queued presentations that have not yet displayed. */
+	uint32_t getUnpresentedImageCount() { return _unpresentedImageCount.load(); }
+
 	/** Adds HDR metadata to this swapchain. */
 	void setHDRMetadataEXT(const VkHdrMetadataEXT& metadata);
 	

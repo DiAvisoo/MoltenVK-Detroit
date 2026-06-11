@@ -24,8 +24,135 @@
 #include "MVKFoundation.h"
 #include "MVKOSExtensions.h"
 #include "MVKGPUCapture.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <pthread.h>
+#include <thread>
 
 using namespace std;
+
+
+static bool mvkDTRSurfaceLogEnabled() {
+	const char* env = getenv("MVK_DTR_SURFACE_LOG");
+	return env && strcmp(env, "1") == 0;
+}
+
+static bool mvkDTRDeferPresentFinishEnabled() {
+	const char* env = getenv("MVK_DTR_DEFER_PRESENT_FINISH");
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static bool mvkDTRLeakPresentSubmissionsEnabled() {
+	const char* env = getenv("MVK_DTR_LEAK_PRESENT_SUBMISSIONS");
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static bool mvkDTRSkipPresentCaptureScopeEnabled() {
+	const char* env = getenv("MVK_DTR_SKIP_PRESENT_CAPTURE_SCOPE");
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static bool mvkDTRSkipPresentFinishEnabled() {
+	const char* env = getenv("MVK_DTR_SKIP_PRESENT_FINISH");
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static bool mvkDTRSkipQueuePresentCompletedHandlerEnabled() {
+	const char* env = getenv("MVK_DTR_SKIP_QUEUE_PRESENT_COMPLETED_HANDLER");
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static bool mvkDTRSkipQueuePresentCommitEnabled() {
+	const char* env = getenv("MVK_DTR_SKIP_QUEUE_PRESENT_COMMIT");
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static bool mvkDTRWaitForPresentedEnabled() {
+	const char* env = getenv("MVK_DTR_WAIT_FOR_PRESENTED");
+	if ( !env ) { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env++ != '1') { return false; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	return *env == '\0';
+}
+
+static uint32_t mvkDTRWaitForPresentedTimeoutMS() {
+	const char* env = getenv("MVK_DTR_WAIT_FOR_PRESENTED_TIMEOUT_MS");
+	if ( !env ) { return 250; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	char* end = nullptr;
+	unsigned long val = strtoul(env, &end, 10);
+	while (end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) { end++; }
+	return (end && *end == '\0') ? (uint32_t)val : 250;
+}
+
+static uint64_t mvkDTRCurrentThreadID() {
+	uint64_t tid = 0;
+	pthread_threadid_np(pthread_self(), &tid);
+	return tid;
+}
+
+static NSString* mvkDTRSurfaceLogPath() {
+	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	return @"/tmp/mvk-dtr-surface.log";
+}
+
+static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
+static void mvkDTRSurfaceLog(const char* fmt, ...) {
+	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
+
+	char msg[2048];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+
+	static mutex logLock;
+	lock_guard<mutex> lock(logLock);
+	@autoreleasepool {
+		NSString* logPath = mvkDTRSurfaceLogPath();
+		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
+		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
+		if ( !logFile ) { return; }
+		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
+		fprintf(logFile, "%s MVK-DTR-QUEUE tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
+		fclose(logFile);
+	}
+}
 
 
 #pragma mark -
@@ -146,7 +273,26 @@ template VkResult MVKQueue::submit(uint32_t submitCount, const VkSubmitInfo2* pS
 template VkResult MVKQueue::submit(uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence, MVKCommandUse cmdUse);
 
 VkResult MVKQueue::submit(const VkPresentInfoKHR* pPresentInfo) {
-	return submit(new MVKQueuePresentSurfaceSubmission(this, pPresentInfo));
+	mvkDTRSurfaceLog("queue present submit begin queue=%p swapchains=%u waits=%u pResults=%p first_swapchain=%p first_index=%u",
+					 this, pPresentInfo->swapchainCount, pPresentInfo->waitSemaphoreCount,
+					 pPresentInfo->pResults,
+					 pPresentInfo->swapchainCount ? pPresentInfo->pSwapchains[0] : VK_NULL_HANDLE,
+					 pPresentInfo->swapchainCount ? pPresentInfo->pImageIndices[0] : 0);
+	if (pPresentInfo->pResults) {
+		for (uint32_t scIdx = 0; scIdx < pPresentInfo->swapchainCount; scIdx++) {
+			mvkDTRSurfaceLog("queue present submit pResults before queue=%p ordinal=%u swapchain=%p slot=%p",
+							 this, scIdx, pPresentInfo->pSwapchains[scIdx], &pPresentInfo->pResults[scIdx]);
+		}
+	}
+	VkResult rslt = submit(new MVKQueuePresentSurfaceSubmission(this, pPresentInfo));
+	mvkDTRSurfaceLog("queue present submit end queue=%p result=%d pResults=%p", this, rslt, pPresentInfo->pResults);
+	if (pPresentInfo->pResults) {
+		for (uint32_t scIdx = 0; scIdx < pPresentInfo->swapchainCount; scIdx++) {
+			mvkDTRSurfaceLog("queue present submit pResults after queue=%p ordinal=%u swapchain=%p slot=%p value=%d top_result=%d",
+							 this, scIdx, pPresentInfo->pSwapchains[scIdx], &pPresentInfo->pResults[scIdx], pPresentInfo->pResults[scIdx], rslt);
+		}
+	}
+	return rslt;
 }
 
 VkResult MVKQueue::waitIdle(MVKCommandUse cmdUse) {
@@ -411,7 +557,11 @@ MVKSemaphoreSubmitInfo& MVKSemaphoreSubmitInfo::operator=(const MVKSemaphoreSubm
 }
 
 MVKSemaphoreSubmitInfo::~MVKSemaphoreSubmitInfo() {
-	if (_semaphore) { _semaphore->release(); }
+	if (_semaphore) {
+		mvkDTRSurfaceLog("semaphore submit info release begin info=%p semaphore=%p value=%llu", this, _semaphore, (unsigned long long)value);
+		_semaphore->release();
+		mvkDTRSurfaceLog("semaphore submit info release end info=%p semaphore=%p value=%llu", this, _semaphore, (unsigned long long)value);
+	}
 }
 
 MVKCommandBufferSubmitInfo::MVKCommandBufferSubmitInfo(const VkCommandBufferSubmitInfo& commandBufferInfo) :
@@ -454,7 +604,16 @@ MVKQueueSubmission::MVKQueueSubmission(MVKQueue* queue,
 }
 
 MVKQueueSubmission::~MVKQueueSubmission() {
+	mvkDTRSurfaceLog("queue submission dtor begin submission=%p queue=%p waits=%zu", this, _queue, _waitSemaphores.size());
+	if ( !_waitSemaphores.empty() ) {
+		mvkDTRSurfaceLog("queue submission wait semaphores clear begin submission=%p queue=%p waits=%zu", this, _queue, _waitSemaphores.size());
+		_waitSemaphores.clear();
+		mvkDTRSurfaceLog("queue submission wait semaphores clear end submission=%p queue=%p", this, _queue);
+	}
+	mvkDTRSurfaceLog("queue submission queue release begin submission=%p queue=%p", this, _queue);
 	_queue->release();
+	mvkDTRSurfaceLog("queue submission queue release end submission=%p queue=%p", this, _queue);
+	mvkDTRSurfaceLog("queue submission dtor end submission=%p queue=%p", this, _queue);
 }
 
 
@@ -713,21 +872,28 @@ MVKQueueFullCommandBufferSubmission<N>::MVKQueueFullCommandBufferSubmission(MVKQ
 // If the semaphores are not encodable, wait on them inline after presenting.
 // The semaphores know what to do.
 VkResult MVKQueuePresentSurfaceSubmission::execute() {
+	mvkDTRSurfaceLog("queue present execute begin submission=%p queue=%p present_count=%zu", this, _queue, _presentInfo.size());
 	// MTLCommandBuffer retain references to avoid rare case where objects are destroyed too early.
 	// Although testing could not determine which objects were being lost, queue present MTLCommandBuffers
 	// are used only once per frame, and retain so few objects, that blanket retention is still performant.
 	id<MTLCommandBuffer> mtlCmdBuff = _queue->getMTLCommandBuffer(kMVKCommandUseQueuePresent, true);
+	mvkDTRSurfaceLog("queue present command buffer submission=%p cmd=%p", this, mtlCmdBuff);
 
 	for (auto& ws : _waitSemaphores) {
 		ws.encodeWait(mtlCmdBuff);	// Encoded semaphore waits
 		ws.encodeWait(nil);			// Inline semaphore waits
 	}
+	mvkDTRSurfaceLog("queue present waits encoded submission=%p waits=%zu", this, _waitSemaphores.size());
 
 	// Wait time from an async vkQueuePresentKHR() call to starting presentation of the swapchains
 	addPerformanceInterval(getPerformanceStats().queue.waitPresentSwapchains, _creationTime);
 
 	for (int i = 0; i < _presentInfo.size(); i++ ) {
+		mvkDTRSurfaceLog("queue present image begin submission=%p ordinal=%d image=%p mode=%u present_id=%llu cmd=%p",
+						 this, i, _presentInfo[i].presentableImage, _presentInfo[i].presentMode,
+						 (unsigned long long)_presentInfo[i].presentId, mtlCmdBuff);
 		setConfigurationResult(_presentInfo[i].presentableImage->presentCAMetalDrawable(mtlCmdBuff, _presentInfo[i]));
+		mvkDTRSurfaceLog("queue present image end submission=%p ordinal=%d result=%d", this, i, getConfigurationResult());
 	}
 
 	if (_queue->_queueFamily->getIndex() == getMVKConfig().defaultGPUCaptureScopeQueueFamilyIndex &&
@@ -742,33 +908,135 @@ VkResult MVKQueuePresentSurfaceSubmission::execute() {
 	// or if the MTLCommandBuffer could not be created, call finish() directly.
 	// Retrieve the result first, because finish() will destroy this instance.
 	VkResult rslt = getConfigurationResult();
+	bool deferPresentFinish = mvkDTRDeferPresentFinishEnabled();
+	bool skipPresentFinish = mvkDTRSkipPresentFinishEnabled();
+	bool skipQueuePresentCompletedHandler = mvkDTRSkipQueuePresentCompletedHandlerEnabled();
+	bool skipQueuePresentCommit = mvkDTRSkipQueuePresentCommitEnabled();
+	bool waitForPresented = mvkDTRWaitForPresentedEnabled();
+	uint32_t waitForPresentedTimeoutMS = mvkDTRWaitForPresentedTimeoutMS();
+	auto presentSwapchains = _presentSwapchains;
+	auto* loggedSubmission = this;
 	if (mtlCmdBuff) {
-		[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mtlCB) { this->finish(); }];
+		if (skipQueuePresentCommit) {
+			mvkDTRSurfaceLog("queue present commit skipped submission=%p cmd=%p result=%d", this, mtlCmdBuff, rslt);
+			return rslt;
+		}
+		if (waitForPresented) {
+			struct CompletionWaiter {
+				mutex lock;
+				condition_variable cond;
+				bool completed = false;
+			};
+			auto completionWaiter = make_shared<CompletionWaiter>();
+			[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mtlCB) {
+				NSString* errDesc = mtlCB.error.localizedDescription ?: @"";
+				mvkDTRSurfaceLog("queue present synchronous completed handler submission=%p cmd=%p status=%lu error=%s", loggedSubmission, mtlCB, (unsigned long)mtlCB.status, errDesc.UTF8String);
+				{
+					lock_guard<mutex> lock(completionWaiter->lock);
+					completionWaiter->completed = true;
+				}
+				completionWaiter->cond.notify_all();
+			}];
+
+			mvkDTRSurfaceLog("queue present synchronous commit begin submission=%p cmd=%p result=%d timeout_ms=%u", this, mtlCmdBuff, rslt, waitForPresentedTimeoutMS);
+			[mtlCmdBuff commit];
+			mvkDTRSurfaceLog("queue present synchronous commit end submission=%p cmd=%p result=%d", this, mtlCmdBuff, rslt);
+
+			bool completed = false;
+			{
+				unique_lock<mutex> lock(completionWaiter->lock);
+				completed = completionWaiter->cond.wait_for(lock, chrono::milliseconds(waitForPresentedTimeoutMS), [&]{ return completionWaiter->completed; });
+			}
+			mvkDTRSurfaceLog("queue present synchronous completion wait end submission=%p cmd=%p completed=%u timeout_ms=%u", loggedSubmission, mtlCmdBuff, completed ? 1 : 0, waitForPresentedTimeoutMS);
+
+			for (size_t scIdx = 0; scIdx < presentSwapchains.size(); scIdx++) {
+				MVKSwapchain* mvkSC = presentSwapchains[scIdx];
+				if ( !mvkSC ) { continue; }
+				uint32_t initialUnpresented = mvkSC->getUnpresentedImageCount();
+				mvkDTRSurfaceLog("queue present synchronous presented wait begin submission=%p ordinal=%zu swapchain=%p initial_unpresented=%u timeout_ms=%u", loggedSubmission, scIdx, mvkSC, initialUnpresented, waitForPresentedTimeoutMS);
+				auto deadline = chrono::steady_clock::now() + chrono::milliseconds(waitForPresentedTimeoutMS);
+				while (mvkSC->getUnpresentedImageCount() && chrono::steady_clock::now() < deadline) {
+					this_thread::sleep_for(chrono::milliseconds(1));
+				}
+				uint32_t finalUnpresented = mvkSC->getUnpresentedImageCount();
+				mvkDTRSurfaceLog("queue present synchronous presented wait end submission=%p ordinal=%zu swapchain=%p final_unpresented=%u timed_out=%u", loggedSubmission, scIdx, mvkSC, finalUnpresented, finalUnpresented ? 1 : 0);
+			}
+
+			if (skipPresentFinish) {
+				mvkDTRSurfaceLog("queue present synchronous finish skipped submission=%p", loggedSubmission);
+				return rslt;
+			}
+			mvkDTRSurfaceLog("queue present synchronous finish begin submission=%p", loggedSubmission);
+			finish();
+			return rslt;
+		}
+		if (skipQueuePresentCompletedHandler) {
+			mvkDTRSurfaceLog("queue present completed handler add skipped submission=%p cmd=%p result=%d", this, mtlCmdBuff, rslt);
+		} else {
+			[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mtlCB) {
+				NSString* errDesc = mtlCB.error.localizedDescription ?: @"";
+				mvkDTRSurfaceLog("queue present completed handler begin submission=%p cmd=%p status=%lu error=%s defer=%u skip_finish=%u", loggedSubmission, mtlCB, (unsigned long)mtlCB.status, errDesc.UTF8String, deferPresentFinish ? 1 : 0, skipPresentFinish ? 1 : 0);
+				if (skipPresentFinish) {
+					mvkDTRSurfaceLog("queue present completed handler finish skipped submission=%p", loggedSubmission);
+					return;
+				}
+				if (deferPresentFinish) {
+					mvkDTRSurfaceLog("queue present completed handler defer finish submission=%p", loggedSubmission);
+					dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+						@autoreleasepool {
+							mvkDTRSurfaceLog("queue present deferred finish begin submission=%p", loggedSubmission);
+							loggedSubmission->finish();
+							mvkDTRSurfaceLog("queue present deferred finish end submission=%p", loggedSubmission);
+						}
+					});
+				} else {
+					loggedSubmission->finish();
+					mvkDTRSurfaceLog("queue present completed handler finish returned submission=%p", loggedSubmission);
+				}
+			}];
+		}
+		mvkDTRSurfaceLog("queue present commit begin submission=%p cmd=%p result=%d", this, mtlCmdBuff, rslt);
 		[mtlCmdBuff commit];
+		mvkDTRSurfaceLog("queue present commit end submission=%p cmd=%p result=%d", this, mtlCmdBuff, rslt);
 	} else {
+		mvkDTRSurfaceLog("queue present finish direct submission=%p result=%d", this, rslt);
 		finish();
 	}
 	return rslt;
 }
 
 void MVKQueuePresentSurfaceSubmission::finish() {
+	mvkDTRSurfaceLog("queue present finish begin submission=%p queue=%p present_count=%zu", this, _queue, _presentInfo.size());
 
 	// Let Xcode know the current frame is done, then start a new frame,
 	// and if auto GPU capture is active, and it's time to stop it, do so.
-	auto cs = _queue->_submissionCaptureScope;
-	cs->endScope();
-	cs->beginScope();
-	if (_queue->_queueFamily->getIndex() == getMVKConfig().defaultGPUCaptureScopeQueueFamilyIndex &&
-		_queue->_index == getMVKConfig().defaultGPUCaptureScopeQueueIndex) {
-		getDevice()->stopAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_FRAME);
+	if (mvkDTRSkipPresentCaptureScopeEnabled()) {
+		mvkDTRSurfaceLog("queue present finish capture skipped submission=%p", this);
+	} else {
+		auto cs = _queue->_submissionCaptureScope;
+		mvkDTRSurfaceLog("queue present finish capture endScope begin submission=%p scope=%p", this, cs);
+		cs->endScope();
+		mvkDTRSurfaceLog("queue present finish capture beginScope begin submission=%p scope=%p", this, cs);
+		cs->beginScope();
+		if (_queue->_queueFamily->getIndex() == getMVKConfig().defaultGPUCaptureScopeQueueFamilyIndex &&
+			_queue->_index == getMVKConfig().defaultGPUCaptureScopeQueueIndex) {
+			mvkDTRSurfaceLog("queue present finish auto capture stop begin submission=%p", this);
+			getDevice()->stopAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_FRAME);
+		}
 	}
 
+	mvkDTRSurfaceLog("queue present finish destroy begin submission=%p", this);
+	if (mvkDTRLeakPresentSubmissionsEnabled()) {
+		mvkDTRSurfaceLog("queue present finish destroy skipped leak submission=%p", this);
+		return;
+	}
 	this->destroy();
 }
 
 MVKQueuePresentSurfaceSubmission::MVKQueuePresentSurfaceSubmission(MVKQueue* queue,
-																   const VkPresentInfoKHR* pPresentInfo)
+											   const VkPresentInfoKHR* pPresentInfo)
 	: MVKQueueSubmission(queue, pPresentInfo->waitSemaphoreCount, pPresentInfo->pWaitSemaphores, nullptr) {
+	mvkDTRSurfaceLog("queue present ctor begin submission=%p queue=%p swapchains=%u waits=%u pResults=%p", this, queue, pPresentInfo->swapchainCount, pPresentInfo->waitSemaphoreCount, pPresentInfo->pResults);
 
 	const VkPresentTimesInfoGOOGLE* pPresentTimesInfo = nullptr;
 	const VkSwapchainPresentFenceInfoKHR* pPresentFenceInfo = nullptr;
@@ -831,8 +1099,10 @@ MVKQueuePresentSurfaceSubmission::MVKQueuePresentSurfaceSubmission(MVKQueue* que
 
 	VkResult* pSCRslts = pPresentInfo->pResults;
 	_presentInfo.reserve(scCnt);
+	_presentSwapchains.reserve(scCnt);
 	for (uint32_t scIdx = 0; scIdx < scCnt; scIdx++) {
 		MVKSwapchain* mvkSC = (MVKSwapchain*)pPresentInfo->pSwapchains[scIdx];
+		VkExtent2D scExtent = mvkSC->getImageExtent();
 		MVKImagePresentInfo presentInfo = {};	// Start with everything zeroed
 		presentInfo.queue = _queue;
 		presentInfo.presentableImage = mvkSC->getPresentableImage(pPresentInfo->pImageIndices[scIdx]);
@@ -845,9 +1115,18 @@ MVKQueuePresentSurfaceSubmission::MVKQueuePresentSurfaceSubmission(MVKQueue* que
 		}
 		mvkSC->setLayerNeedsDisplay(pRegions ? &pRegions[scIdx] : nullptr);
 		_presentInfo.push_back(presentInfo);
+		_presentSwapchains.push_back(mvkSC);
 		VkResult scRslt = mvkSC->getSurfaceStatus();
 		if (pSCRslts) { pSCRslts[scIdx] = scRslt; }
 		setConfigurationResult(scRslt);
+		mvkDTRSurfaceLog("queue present ctor swapchain submission=%p ordinal=%u swapchain=%p index=%u image=%p extent=%ux%u status=%d pResults=%p pResults_value=%d mode=%u present_id=%llu",
+						 this, scIdx, mvkSC, pPresentInfo->pImageIndices[scIdx], presentInfo.presentableImage,
+						 scExtent.width, scExtent.height, scRslt, pSCRslts ? &pSCRslts[scIdx] : nullptr, pSCRslts ? pSCRslts[scIdx] : VK_SUCCESS, presentInfo.presentMode,
+						 (unsigned long long)presentInfo.presentId);
 	}
+	mvkDTRSurfaceLog("queue present ctor end submission=%p result=%d present_count=%zu pResults=%p", this, getConfigurationResult(), _presentInfo.size(), pSCRslts);
 }
 
+MVKQueuePresentSurfaceSubmission::~MVKQueuePresentSurfaceSubmission() {
+	mvkDTRSurfaceLog("queue present dtor submission=%p queue=%p present_count=%zu", this, _queue, _presentInfo.size());
+}

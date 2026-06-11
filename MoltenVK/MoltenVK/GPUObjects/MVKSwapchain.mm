@@ -26,13 +26,100 @@
 #include "MVKWatermarkTextureContent.h"
 #include "MVKWatermarkShaderSource.h"
 #include "mvk_datatypes.hpp"
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <libkern/OSByteOrder.h>
+#include <mutex>
+#include <pthread.h>
 
 #import "CAMetalLayer+MoltenVK.h"
 #import "MVKBlockObserver.h"
 
 
 using namespace std;
+
+
+static bool mvkDTRBoolEnvValue(const char* name, bool defaultValue) {
+	const char* env = getenv(name);
+	if ( !env ) { return defaultValue; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env == '0') { return false; }
+	if (*env == '1') { return true; }
+	return defaultValue;
+}
+
+static bool mvkDTRSurfaceLogEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG", false);
+}
+
+static bool mvkDTRSurfaceLogAllImagesEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG_ALL_IMAGES", false);
+}
+
+static bool mvkDTRSkipForceUnpresentedCompletionEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_FORCE_UNPRESENTED_COMPLETION", true);
+}
+
+static bool mvkDTRDisableLayerActionsEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_DISABLE_LAYER_ACTIONS", true);
+}
+
+static void mvkDTRRunWithDisabledLayerActions(void (^block)(void)) {
+	if ( !mvkDTRDisableLayerActionsEnabled() ) {
+		block();
+		return;
+	}
+
+	[CATransaction begin];
+	[CATransaction setDisableActions: YES];
+	[CATransaction setAnimationDuration: 0.0];
+	block();
+	[CATransaction commit];
+}
+
+static bool mvkDTRShouldLogSwapchainImage(VkExtent2D extent) {
+	return mvkDTRSurfaceLogEnabled() && (mvkDTRSurfaceLogAllImagesEnabled() || extent.width >= 3000 || extent.height >= 1500);
+}
+
+static uint64_t mvkDTRCurrentThreadID() {
+	uint64_t tid = 0;
+	pthread_threadid_np(pthread_self(), &tid);
+	return tid;
+}
+
+static NSString* mvkDTRSurfaceLogPath() {
+	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	return @"/tmp/mvk-dtr-surface.log";
+}
+
+static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
+static void mvkDTRSurfaceLog(const char* fmt, ...) {
+	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
+
+	char msg[2048];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+
+	static mutex logLock;
+	lock_guard<mutex> lock(logLock);
+	@autoreleasepool {
+		NSString* logPath = mvkDTRSurfaceLogPath();
+		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
+		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
+		if ( !logFile ) { return; }
+		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
+		fprintf(logFile, "%s MVK-DTR-SWAPCHAIN tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
+		fclose(logFile);
+	}
+}
 
 
 #pragma mark -
@@ -55,21 +142,25 @@ VkResult MVKSwapchain::getImages(uint32_t* pCount, VkImage* pSwapchainImages) {
 
 	// Get the number of surface images
 	uint32_t imgCnt = getImageCount();
+	uint32_t requestedCount = pCount ? *pCount : 0;
 
 	// If images aren't actually being requested yet, simply update the returned count
 	if ( !pSwapchainImages ) {
 		*pCount = imgCnt;
+		mvkDTRSurfaceLog("get images count swapchain=%p surface=%p requested=%u returned=%u layer=%p", this, _surface, requestedCount, imgCnt, getCAMetalLayer());
 		return VK_SUCCESS;
 	}
 
 	// Determine how many images we'll return, and return that number
 	VkResult result = (*pCount >= imgCnt) ? VK_SUCCESS : VK_INCOMPLETE;
 	*pCount = min(*pCount, imgCnt);
+	mvkDTRSurfaceLog("get images populate begin swapchain=%p surface=%p requested=%u returning=%u result=%d layer=%p", this, _surface, requestedCount, *pCount, result, getCAMetalLayer());
 
 	// Now populate the images
 	for (uint32_t imgIdx = 0; imgIdx < *pCount; imgIdx++) {
 		pSwapchainImages[imgIdx] = (VkImage)_presentableImages[imgIdx];
 	}
+	mvkDTRSurfaceLog("get images populate end swapchain=%p returned=%u first=%p", this, *pCount, *pCount ? _presentableImages[0] : nullptr);
 
 	return result;
 }
@@ -81,7 +172,15 @@ VkResult MVKSwapchain::acquireNextImage(uint64_t timeout,
 										uint32_t* pImageIndex) {
 
 	if ( _device->getConfigurationResult() != VK_SUCCESS ) { return _device->getConfigurationResult(); }
+	if ( getConfigurationResult() != VK_SUCCESS ) {
+		mvkDTRSurfaceLog("acquire returning swapchain config result swapchain=%p result=%d", this, getConfigurationResult());
+		return getConfigurationResult();
+	}
 	if ( getIsSurfaceLost() ) { return VK_ERROR_SURFACE_LOST_KHR; }
+	bool shouldLogImage = mvkDTRShouldLogSwapchainImage(_imageExtent);
+	if (shouldLogImage) {
+		mvkDTRSurfaceLog("acquire next begin swapchain=%p surface=%p extent=%ux%u images=%u sem=%p fence=%p", this, _surface, _imageExtent.width, _imageExtent.height, getImageCount(), semaphore, fence);
+	}
 
 	// Find the image that has the shortest wait by finding the smallest availability measure.
 	MVKPresentableSwapchainImage* minWaitImage = nullptr;
@@ -100,7 +199,11 @@ VkResult MVKSwapchain::acquireNextImage(uint64_t timeout,
 	// and signal the semaphore and fence when it's available
 	*pImageIndex = minWaitImage->_swapchainIndex;
 	VkResult rslt = minWaitImage->acquireAndSignalWhenAvailable((MVKSemaphore*)semaphore, (MVKFence*)fence);
-	return rslt ? rslt : getSurfaceStatus();
+	VkResult finalRslt = rslt ? rslt : getSurfaceStatus();
+	if (shouldLogImage) {
+		mvkDTRSurfaceLog("acquire next end swapchain=%p image=%p index=%u result=%d surface_status=%d", this, minWaitImage, *pImageIndex, rslt, finalRslt);
+	}
+	return finalRslt;
 }
 
 VkResult MVKSwapchain::releaseImages(const VkReleaseSwapchainImagesInfoKHR* pReleaseInfo) {
@@ -121,6 +224,10 @@ bool MVKSwapchain::getIsSurfaceLost() {
 
 VkResult MVKSwapchain::getSurfaceStatus() {
 	if (_device->getConfigurationResult() != VK_SUCCESS) { return _device->getConfigurationResult(); }
+	if (getConfigurationResult() != VK_SUCCESS) {
+		mvkDTRSurfaceLog("surface status returning swapchain config result swapchain=%p result=%d", this, getConfigurationResult());
+		return getConfigurationResult();
+	}
 	if (getIsSurfaceLost()) { return VK_ERROR_SURFACE_LOST_KHR; }
 	if ( !hasOptimalSurface() ) { return VK_SUBOPTIMAL_KHR; }
 	return VK_SUCCESS;
@@ -253,15 +360,19 @@ VkResult MVKSwapchain::waitForPresent(const VkPresentWait2InfoKHR* pWaitInfo) {
 }
 
 void MVKSwapchain::beginPresentation(const MVKImagePresentInfo& presentInfo) {
+	mvkDTRSurfaceLog("swapchain begin presentation swapchain=%p image=%p extent=%ux%u unpresented_before=%u present_id=%llu", this, presentInfo.presentableImage, _imageExtent.width, _imageExtent.height, _unpresentedImageCount.load(), (unsigned long long)presentInfo.presentId);
 	_unpresentedImageCount++;
 }
 
 void MVKSwapchain::endPresentation(const MVKImagePresentInfo& presentInfo, uint64_t beginPresentTime, uint64_t actualPresentTime) {
+	mvkDTRSurfaceLog("swapchain end presentation begin swapchain=%p image=%p extent=%ux%u unpresented_before=%u present_id=%llu", this, presentInfo.presentableImage, _imageExtent.width, _imageExtent.height, _unpresentedImageCount.load(), (unsigned long long)presentInfo.presentId);
 	_unpresentedImageCount--;
 
 	std::lock_guard<std::mutex> lock(_presentHistoryLock);
+	mvkDTRSurfaceLog("swapchain end presentation history locked swapchain=%p unpresented_after=%u history_count=%u history_index=%u", this, _unpresentedImageCount.load(), _presentHistoryCount, _presentHistoryIndex);
 
 	markFrameInterval();
+	mvkDTRSurfaceLog("swapchain end presentation marked frame swapchain=%p", this);
 	if (_presentHistoryCount < kMaxPresentationHistory) {
 		_presentHistoryCount++;
 	} else {
@@ -275,9 +386,11 @@ void MVKSwapchain::endPresentation(const MVKImagePresentInfo& presentInfo, uint6
 	_presentTimingHistory[_presentHistoryIndex].earliestPresentTime = actualPresentTime;
 	_presentTimingHistory[_presentHistoryIndex].presentMargin = actualPresentTime > beginPresentTime ? actualPresentTime - beginPresentTime : 0;
 	_presentHistoryIndex = (_presentHistoryIndex + 1) % kMaxPresentationHistory;
+	mvkDTRSurfaceLog("swapchain end presentation end swapchain=%p history_count=%u history_index=%u", this, _presentHistoryCount, _presentHistoryIndex);
 }
 
 void MVKSwapchain::notifyPresentComplete(const MVKImagePresentInfo& presentInfo) {
+	mvkDTRSurfaceLog("swapchain notify present complete swapchain=%p image=%p present_id=%llu", this, presentInfo.presentableImage, (unsigned long long)presentInfo.presentId);
 	if (presentInfo.presentId != 0) {
 		std::unique_lock pidLock(_currentPresentIdMutex);
 		_currentPresentId = std::max(_currentPresentId, presentInfo.presentId);
@@ -290,9 +403,22 @@ void MVKSwapchain::notifyPresentComplete(const MVKImagePresentInfo& presentInfo)
 // drawableSize of the CAMetalLayer, which will trigger presentation completion and callbacks.
 // The drawableSize will be set to a correct size by the next swapchain created on the same surface.
 void MVKSwapchain::forceUnpresentedImageCompletion() {
-	if (_unpresentedImageCount) {
-		getCAMetalLayer().drawableSize = { 1,1 };
+	uint32_t unpresentedImageCount = _unpresentedImageCount.load();
+	if ( !unpresentedImageCount ) { return; }
+
+	auto* mtlLayer = getCAMetalLayer();
+	if ( !mtlLayer ) { return; }
+
+	if (mvkDTRSkipForceUnpresentedCompletionEnabled()) {
+		mvkDTRSurfaceLog("force unpresented image completion skipped swapchain=%p surface=%p layer=%p unpresented=%u", this, _surface, mtlLayer, unpresentedImageCount);
+		return;
 	}
+
+	mvkDTRSurfaceLog("force unpresented image completion swapchain=%p surface=%p layer=%p unpresented=%u", this, _surface, mtlLayer, unpresentedImageCount);
+	mvkDTRRunWithDisabledLayerActions(^{
+		CGSize forcedSize = { 1,1 };
+		mtlLayer.drawableSize = forcedSize;
+	});
 }
 
 void MVKSwapchain::setLayerNeedsDisplay(const VkPresentRegionKHR* pRegion) {
@@ -393,12 +519,15 @@ MVKSwapchain::MVKSwapchain(MVKDevice* device, const VkSwapchainCreateInfoKHR* pC
 	: MVKVulkanAPIDeviceObject(device),
 	_surface((MVKSurface*)pCreateInfo->surface),
 	_imageExtent(pCreateInfo->imageExtent) {
+	mvkDTRSurfaceLog("create swapchain begin swapchain=%p surface=%p old=%p active=%p extent=%ux%u min_images=%u present_mode=%u", this, _surface, pCreateInfo->oldSwapchain, _surface->_activeSwapchain, pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height, pCreateInfo->minImageCount, pCreateInfo->presentMode);
+	_surface->logNativeState("create swapchain begin");
 
 	// Check if oldSwapchain is properly set
 	auto* oldSwapchain = (MVKSwapchain*)pCreateInfo->oldSwapchain;
 	if (oldSwapchain == _surface->_activeSwapchain) {
 		_surface->setActiveSwapchain(this);
 	} else {
+		mvkDTRSurfaceLog("create swapchain old mismatch swapchain=%p surface=%p old=%p active=%p", this, _surface, oldSwapchain, _surface->_activeSwapchain);
 		setConfigurationResult(reportError(VK_ERROR_NATIVE_WINDOW_IN_USE_KHR, "vkCreateSwapchainKHR(): pCreateInfo->oldSwapchain does not match the VkSwapchain that is in use by the surface"));
 		return;
 	}
@@ -439,6 +568,7 @@ MVKSwapchain::MVKSwapchain(MVKDevice* device, const VkSwapchainCreateInfoKHR* pC
 							   mtlFeats.maxSwapchainImageCount);
 	initCAMetalLayer(pCreateInfo, pScalingInfo, imgCnt);
     initSurfaceImages(pCreateInfo, imgCnt);		// After initCAMetalLayer()
+	mvkDTRSurfaceLog("create swapchain end swapchain=%p result=%d image_count=%zu layer=%p", this, getConfigurationResult(), _presentableImages.size(), getCAMetalLayer());
 }
 
 // kCAGravityResize is the Metal default
@@ -488,6 +618,8 @@ void MVKSwapchain::initCAMetalLayer(const VkSwapchainCreateInfoKHR* pCreateInfo,
 
 	VkExtent2D prevSurfaceExtent = _surface->getExtent();
 	auto* oldSwapchain = (MVKSwapchain*)pCreateInfo->oldSwapchain;
+	mvkDTRSurfaceLog("init CAMetalLayer swapchain=%p layer=%p old=%p image_extent=%ux%u prev_surface=%ux%u natural=%ux%u", this, mtlLayer, oldSwapchain, _imageExtent.width, _imageExtent.height, prevSurfaceExtent.width, prevSurfaceExtent.height, _surface->getNaturalExtent().width, _surface->getNaturalExtent().height);
+	_surface->logNativeState("init CAMetalLayer begin");
 
 	// Because of a regression in Metal, the most recent one or two presentations may not
 	// complete and call back. Changing the CAMetalLayer drawableSize will force any incomplete
@@ -499,77 +631,85 @@ void MVKSwapchain::initCAMetalLayer(const VkSwapchainCreateInfoKHR* pCreateInfo,
 	}
 
 	auto minMagFilter = getMVKConfig().swapchainMinMagFilterUseNearest ? kCAFilterNearest : kCAFilterLinear;
-	mtlLayer.drawableSize = mvkCGSizeFromVkExtent2D(_imageExtent);
-	mtlLayer.device = getMTLDevice();
-	mtlLayer.pixelFormat = getPixelFormats()->getMTLPixelFormat(pCreateInfo->imageFormat);
-	mtlLayer.maximumDrawableCount = imgCnt;
-	mtlLayer.displaySyncEnabledMVK = (pCreateInfo->presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
-	mtlLayer.minificationFilter = minMagFilter;
-	mtlLayer.magnificationFilter = minMagFilter;
-	mtlLayer.contentsGravity = getCALayerContentsGravity(pScalingInfo);
-	mtlLayer.framebufferOnly = !mvkIsAnyFlagEnabled(pCreateInfo->imageUsage, (VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-																			  VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-																			  VK_IMAGE_USAGE_SAMPLED_BIT |
-																			  VK_IMAGE_USAGE_STORAGE_BIT)) &&
+	mvkDTRRunWithDisabledLayerActions(^{
+		mtlLayer.drawableSize = mvkCGSizeFromVkExtent2D(_imageExtent);
+		mtlLayer.device = getMTLDevice();
+		mtlLayer.pixelFormat = getPixelFormats()->getMTLPixelFormat(pCreateInfo->imageFormat);
+		mtlLayer.maximumDrawableCount = imgCnt;
+		mtlLayer.displaySyncEnabledMVK = (pCreateInfo->presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
+		mtlLayer.minificationFilter = minMagFilter;
+		mtlLayer.magnificationFilter = minMagFilter;
+		mtlLayer.contentsGravity = getCALayerContentsGravity(pScalingInfo);
+		mtlLayer.framebufferOnly = !mvkIsAnyFlagEnabled(pCreateInfo->imageUsage, (VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+												  VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+												  VK_IMAGE_USAGE_SAMPLED_BIT |
+												  VK_IMAGE_USAGE_STORAGE_BIT)) &&
 								!mvkAreAllFlagsEnabled(pCreateInfo->flags, VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR);
 
-	if (pCreateInfo->compositeAlpha != VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
-		mtlLayer.opaque = pCreateInfo->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-	}
+		if (pCreateInfo->compositeAlpha != VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+			mtlLayer.opaque = pCreateInfo->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+		}
 
-	switch (pCreateInfo->imageColorSpace) {
-		case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceSRGB;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
-			break;
-		case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceDisplayP3;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedLinearSRGB;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedSRGB;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedLinearDisplayP3;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceDCIP3;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceITUR_709;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
-			break;
-		case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedLinearITUR_2020;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceITUR_2100_PQ;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_HDR10_HLG_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceITUR_2100_HLG;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
-			break;
-		case VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT:
-			mtlLayer.colorspaceNameMVK = kCGColorSpaceAdobeRGB1998;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
-			break;
-		case VK_COLOR_SPACE_PASS_THROUGH_EXT:
-			mtlLayer.colorspace = nil;
-			mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
-			break;
-		default:
-			setConfigurationResult(reportError(VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateSwapchainKHR(): Metal does not support VkColorSpaceKHR value %d.", pCreateInfo->imageColorSpace));
-			break;
-	}
+		switch (pCreateInfo->imageColorSpace) {
+			case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceSRGB;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
+				break;
+			case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceDisplayP3;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedLinearSRGB;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedSRGB;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedLinearDisplayP3;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceDCIP3;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceITUR_709;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
+				break;
+			case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceExtendedLinearITUR_2020;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceITUR_2100_PQ;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_HDR10_HLG_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceITUR_2100_HLG;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = YES;
+				break;
+			case VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT:
+				mtlLayer.colorspaceNameMVK = kCGColorSpaceAdobeRGB1998;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
+				break;
+			case VK_COLOR_SPACE_PASS_THROUGH_EXT:
+				mtlLayer.colorspace = nil;
+				mtlLayer.wantsExtendedDynamicRangeContentMVK = NO;
+				break;
+			default:
+				setConfigurationResult(reportError(VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateSwapchainKHR(): Metal does not support VkColorSpaceKHR value %d.", pCreateInfo->imageColorSpace));
+				break;
+		}
+	});
+	mvkDTRSurfaceLog("init CAMetalLayer end swapchain=%p layer=%p result=%d drawable=%zux%zu pixfmt=%llu max_drawables=%lu display_sync=%u framebuffer_only=%u opaque=%u disable_actions=%u",
+					 this, mtlLayer, getConfigurationResult(), (size_t)mtlLayer.drawableSize.width, (size_t)mtlLayer.drawableSize.height,
+					 (unsigned long long)mtlLayer.pixelFormat, (unsigned long)mtlLayer.maximumDrawableCount,
+					 mtlLayer.displaySyncEnabledMVK ? 1 : 0, mtlLayer.framebufferOnly ? 1 : 0, mtlLayer.opaque ? 1 : 0,
+					 mvkDTRDisableLayerActionsEnabled() ? 1 : 0);
+	_surface->logNativeState("init CAMetalLayer end");
 
 	// TODO: set additional CAMetalLayer properties before extracting drawables:
 	//	- presentsWithTransaction
@@ -625,7 +765,10 @@ void MVKSwapchain::initSurfaceImages(const VkSwapchainCreateInfoKHR* pCreateInfo
 	// lazily, and hence is already deferred (or as deferred as we can make it).
 
 	for (uint32_t imgIdx = 0; imgIdx < imgCnt; imgIdx++) {
-		_presentableImages.push_back(_device->createPresentableSwapchainImage(&imgInfo, this, imgIdx, nullptr));
+		mvkDTRSurfaceLog("create presentable image begin swapchain=%p index=%u extent=%ux%u format=%u usage=0x%x", this, imgIdx, imgExtent.width, imgExtent.height, imgInfo.format, imgInfo.usage);
+		auto* img = _device->createPresentableSwapchainImage(&imgInfo, this, imgIdx, nullptr);
+		_presentableImages.push_back(img);
+		mvkDTRSurfaceLog("create presentable image end swapchain=%p index=%u image=%p result=%d", this, imgIdx, img, img ? img->getConfigurationResult() : VK_ERROR_OUT_OF_HOST_MEMORY);
 	}
 
 	auto* mtlLayer = getCAMetalLayer();
@@ -646,6 +789,8 @@ void MVKSwapchain::initSurfaceImages(const VkSwapchainCreateInfoKHR* pCreateInfo
 }
 
 void MVKSwapchain::destroy() {
+	mvkDTRSurfaceLog("destroy swapchain swapchain=%p surface=%p active=%p result=%d", this, _surface, _surface->_activeSwapchain, getConfigurationResult());
+	_surface->logNativeState("destroy swapchain");
 	// If this swapchain was not replaced by a new swapchain, remove this swapchain
 	// from the surface, and force any outstanding presentations to complete.
 	if (_surface->_activeSwapchain == this) {
@@ -653,10 +798,11 @@ void MVKSwapchain::destroy() {
 		forceUnpresentedImageCompletion();
 	}
 	for (auto& img : _presentableImages) { _device->destroyPresentableSwapchainImage(img, NULL); }
+	mvkDTRSurfaceLog("destroy swapchain images complete swapchain=%p surface=%p image_count=%zu", this, _surface, _presentableImages.size());
+	mvkDTRSurfaceLog("destroy swapchain base destroy begin swapchain=%p surface=%p", this, _surface);
 	MVKVulkanAPIDeviceObject::destroy();
 }
 
 MVKSwapchain::~MVKSwapchain() {
     if (_licenseWatermark) { _licenseWatermark->destroy(); }
 }
-

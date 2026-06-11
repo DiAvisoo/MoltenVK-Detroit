@@ -38,8 +38,15 @@
 
 #include <sys/stat.h>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 using namespace std;
+
+static bool mvkDTRForceArgumentEncodersEnabled() {
+	const char* env = getenv("MVK_DTR_FORCE_ARGUMENT_ENCODERS");
+	return env && strcmp(env, "1") == 0;
+}
 
 
 #if MVK_MACOS
@@ -2684,6 +2691,14 @@ void MVKPhysicalDevice::initMetalFeatures() {
 	_metalFeatures.needsArgumentBufferEncoders = !(mvkOSVersionIsAtLeast(13.0, 16.0, 1.0) &&
 													supportsMTLGPUFamily(Metal3) &&
 													_metalFeatures.argumentBuffersTier >= MTLArgumentBuffersTier2);
+	if (mvkDTRForceArgumentEncodersEnabled()) {
+		if (_metalFeatures.descriptorSetArgumentBuffers) {
+			_metalFeatures.needsArgumentBufferEncoders = true;
+			MVKLogInfo("MVK-DTR-BINARY-ARCHIVE: forcing Metal argument encoders by MVK_DTR_FORCE_ARGUMENT_ENCODERS=1");
+		} else {
+			MVKLogInfo("MVK-DTR-BINARY-ARCHIVE: MVK_DTR_FORCE_ARGUMENT_ENCODERS=1 requested, but descriptor-set argument buffers are unavailable");
+		}
+	}
 
 	_isUsingMetalArgumentBuffers = _metalFeatures.descriptorSetArgumentBuffers && getMVKConfig().useMetalArgumentBuffers;
 

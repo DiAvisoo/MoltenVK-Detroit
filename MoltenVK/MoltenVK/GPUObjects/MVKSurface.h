@@ -80,7 +80,9 @@ protected:
 	void propagateDebugName() override {}
 	void setActiveSwapchain(MVKSwapchain* swapchain);
 	void initLayer(CAMetalLayer* mtlLayer, const char* vkFuncName, bool isHeadless);
+	void replaceLayer(CAMetalLayer* mtlLayer);
 	void releaseLayer();
+	void logNativeState(const char* stage);
 
 	std::mutex _layerLock;
 	MVKInstance* _mvkInstance = nullptr;
@@ -88,4 +90,3 @@ protected:
 	MVKBlockObserver* _layerObserver = nil;
 	MVKSwapchain* _activeSwapchain = nullptr;
 };
-

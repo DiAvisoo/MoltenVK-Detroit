@@ -1,3 +1,103 @@
+# Detroit: Become Human CrossOver Preview Fix
+
+Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver Preview**.
+
+This build fixes the fullscreen/windowed crash and flicker bug and enables the Metal shader cache by default. The first setup pass still needs a fresh Detroit `ShaderCache`, but after the Metal cache is built you should not need to delete Detroit's `ShaderCache` folder again. Without this patched MoltenVK, starting the game can take around 20 minutes depending on hardware. After the cache is built, startup should take less than 20 seconds.
+
+It builds on the work in [alexdremov/MoltenVK](https://github.com/alexdremov/MoltenVK), [alexdremov/SPIRV-Cross](https://github.com/alexdremov/SPIRV-Cross), and the great research in [KhronosGroup/MoltenVK#2054](https://github.com/KhronosGroup/MoltenVK/issues/2054).
+
+## Detroit Install
+
+1. Quit CrossOver Preview completely.
+
+2. Back up CrossOver Preview's original MoltenVK:
+
+```sh
+cp "/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib64/libMoltenVK.dylib" "$HOME/Desktop/libMoltenVK.dylib.backup"
+```
+
+3. Install this patched MoltenVK:
+
+```sh
+sudo install -m 755 libMoltenVK.dylib "/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib64/libMoltenVK.dylib"
+```
+
+4. Edit the Detroit/Steam bottle's `cxbottle.conf` and add under `[EnvironmentVariables]`:
+
+```ini
+"MVK_CONFIG_SHADER_COMPRESSION_ALGORITHM" = "3"
+"MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION" = "1"
+```
+
+5. Edit Detroit's `GraphicOptions.JSON` and set:
+
+```json
+"DEPTH_OF_FIELD": 0
+```
+
+6. Apply the background blur hex fix to `DetroitBecomeHuman.exe`.
+
+Back up the executable first:
+
+```sh
+cp "DetroitBecomeHuman.exe" "DetroitBecomeHuman.exe.backup-before-blur-patch"
+```
+
+If you want to use Hex Fiend, install it with Homebrew:
+
+```sh
+brew install --cask hex-fiend
+```
+
+Open the executable in Hex Fiend or another hex editor. Search as hex for:
+
+```text
+41 C7 83 40 01 00 00 31 00 00
+```
+
+Replace with:
+
+```text
+7F C7 83 40 01 00 00 31 00 00
+```
+
+Only the first byte changes from `41` to `7F`.
+
+## Shader Cache
+
+For first setup only, delete Detroit's `ShaderCache` folder if you already have one. This forces the game to regenerate shaders with the patched MoltenVK.
+
+Start Detroit once. The game will go through `Compiling Shaders`; this can take around 20 minutes depending on hardware.
+
+After that finishes, quit the game and run:
+
+```sh
+Scripts/compile_msl_library_cache.sh
+```
+
+This precompiles the Metal source files MoltenVK saved into `.metallib` files. It also takes some time, but after it finishes Detroit should launch in under 20 seconds on future starts. Do not delete Detroit's `ShaderCache` folder for normal future launches after this script has completed.
+
+When launching with the finished cache, there may be no visible game window for about 20 seconds. Be patient; the window should appear once the cached Metal libraries are loaded.
+
+The cached Metal files folder can use around 3 GB of disk space.
+
+Default cache folder:
+
+```text
+~/Library/Caches/MoltenVK/detroit-msl-library-cache-full
+```
+
+## Optional Env Vars
+
+- `VK_DTR_MSL_LIBRARY_DISK_CACHE_DIR=/path/to/cache`: use a different Metal cache folder.
+- `MVK_DTR_MSL_LIBRARY_CACHE=0`: disable the Metal shader cache.
+- `MVK_DTR_SURFACE_LOG=1`: enable MoltenVK diagnostics.
+- `MVK_DTR_SURFACE_LOG_PATH=/path/to/log`: write diagnostics to a custom path.
+- `MVK_DTR_SURFACE_STABLE_WINDOW_LAYER=0`: disable the fullscreen/windowed flicker workaround.
+- `MVK_DTR_RETAIN_DRAWABLE_UNTIL_PRESENTED=0`: disable the drawable-retain safety path.
+
+-----
+
 <a class="site-logo" href="https://github.com/KhronosGroup/MoltenVK" title="MoltenVK">
 	<img src="Docs/images/MoltenVK-Logo-Banner.png" alt="MoltenVK" style="width:256px;height:auto">
 </a>

@@ -22,11 +22,61 @@
 #include "MVKQueue.h"
 #include "mvk_datatypes.hpp"
 #include "MVKFoundation.h"
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <mutex>
+#include <pthread.h>
 #include <stdlib.h>
 #include <os/lock.h>
 
 using namespace std;
+
+
+static bool mvkDTRMemoryLogEnabled() {
+	const char* env = getenv("MVK_DTR_SURFACE_LOG");
+	return env && strcmp(env, "1") == 0;
+}
+
+static uint64_t mvkDTRCurrentThreadID() {
+	uint64_t tid = 0;
+	pthread_threadid_np(pthread_self(), &tid);
+	return tid;
+}
+
+static NSString* mvkDTRMemoryLogPath() {
+	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
+
+	return @"/tmp/mvk-dtr-surface.log";
+}
+
+static void mvkDTRMemoryLog(const char* fmt, ...) __printflike(1, 2);
+static void mvkDTRMemoryLog(const char* fmt, ...) {
+	if ( !mvkDTRMemoryLogEnabled() ) { return; }
+
+	char msg[2048];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+
+	static mutex logLock;
+	lock_guard<mutex> lock(logLock);
+	@autoreleasepool {
+		NSString* logPath = mvkDTRMemoryLogPath();
+		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
+		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
+		if ( !logFile ) { return; }
+		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
+		fprintf(logFile, "%s MVK-DTR-MEMORY tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
+		fclose(logFile);
+	}
+}
 
 
 #pragma mark MVKDeviceMemory
@@ -172,7 +222,7 @@ VkResult MVKDeviceMemory::addImageMemoryBinding(MVKImageMemoryBinding* mvkImg) {
 		return reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "Could not bind VkImage %p to a VkDeviceMemory dedicated to resource %p. A dedicated allocation may only be used with the resource it was dedicated to.", mvkImg, getDedicatedResource() );
 	}
 
-	if (!_isDedicated) { _imageMemoryBindings.push_back(mvkImg); }
+	if (!mvkContains(_imageMemoryBindings, mvkImg)) { _imageMemoryBindings.push_back(mvkImg); }
 
 	return VK_SUCCESS;
 }
@@ -181,8 +231,20 @@ void MVKDeviceMemory::removeImageMemoryBinding(MVKDeviceMemory** pMem, MVKImageM
 	os_unfair_lock_lock(&s_device_memory_destruction_lock);
 	if (MVKDeviceMemory* mem = *pMem) {
 		*pMem = nullptr;
-		std::lock_guard<std::mutex> lock(mem->_rezLock);
-		mvkRemoveAllOccurances(mem->_imageMemoryBindings, mvkImg);
+		@try {
+			try {
+				std::lock_guard<std::mutex> lock(mem->_rezLock);
+				mvkRemoveAllOccurances(mem->_imageMemoryBindings, mvkImg);
+			} catch (const std::exception& ex) {
+				mvkDTRMemoryLog("remove image memory binding exception mem=%p binding=%p what=%s", mem, mvkImg, ex.what());
+			} catch (...) {
+				mvkDTRMemoryLog("remove image memory binding unknown exception mem=%p binding=%p", mem, mvkImg);
+			}
+		} @catch (NSException* ex) {
+			NSString* exName = ex.name ?: @"";
+			NSString* exReason = ex.reason ?: @"";
+			mvkDTRMemoryLog("remove image memory binding objc exception mem=%p binding=%p name=%s reason=%s", mem, mvkImg, exName.UTF8String, exReason.UTF8String);
+		}
 	}
 	os_unfair_lock_unlock(&s_device_memory_destruction_lock);
 }

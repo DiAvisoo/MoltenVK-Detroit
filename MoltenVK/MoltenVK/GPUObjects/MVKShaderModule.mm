@@ -20,9 +20,516 @@
 #include "MVKPipeline.h"
 #include "MVKFoundation.h"
 #include <sys/stat.h>
+#include <condition_variable>
+#include <cctype>
+#include <cstdarg>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace std;
 using namespace mvk;
+
+#define MVK_DTR_SHADER_LOG_PREFIX "MVK-DTR-BINARY-ARCHIVE: "
+
+static bool mvkDTRBoolEnvValue(const char* name, bool defaultValue) {
+	const char* env = getenv(name);
+	if ( !env ) { return defaultValue; }
+	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
+	if (*env == '0') { return false; }
+	if (*env == '1') { return true; }
+	return defaultValue;
+}
+
+static const char* mvkDTRGetEnv(const char* primaryName, const char* fallbackName = nullptr) {
+	const char* env = getenv(primaryName);
+	if (env && *env) { return env; }
+	return fallbackName ? getenv(fallbackName) : nullptr;
+}
+
+static bool mvkDTRShaderCacheLogEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SHADER_CACHE_LOG", false);
+}
+
+static uint64_t mvkDTRShaderSlowCompileThresholdNS() {
+	const char* env = getenv("MVK_DTR_SHADER_SLOW_COMPILE_MS");
+	double thresholdMS = (env && *env) ? strtod(env, nullptr) : 1000.0;
+	return thresholdMS <= 0.0 ? 0 : (uint64_t)(thresholdMS * 1000000.0);
+}
+
+static bool mvkDTRShaderResourceLogEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_SHADER_RESOURCE_LOG", false);
+}
+
+static bool mvkDTRMSLLibraryCacheEnabled() {
+	return mvkDTRBoolEnvValue("MVK_DTR_MSL_LIBRARY_CACHE", true);
+}
+
+static NSString* mvkDTRMSLLibraryDiskCacheDir() {
+	const char* env = mvkDTRGetEnv("VK_DTR_MSL_LIBRARY_DISK_CACHE_DIR", "MVK_DTR_MSL_LIBRARY_DISK_CACHE_DIR");
+	if (env && *env) { return [[NSString stringWithUTF8String: env] stringByExpandingTildeInPath]; }
+
+	NSArray<NSString*>* cacheDirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+	NSString* cacheRoot = cacheDirs.count ? cacheDirs[0] : [NSHomeDirectory() stringByAppendingPathComponent: @"Library/Caches"];
+	return [[cacheRoot stringByAppendingPathComponent: @"MoltenVK"] stringByAppendingPathComponent: @"detroit-msl-library-cache-full"];
+}
+
+static bool mvkDTRMSLLibraryDiskCacheEnabled() { return mvkDTRMSLLibraryCacheEnabled() && mvkDTRMSLLibraryDiskCacheDir() != nil; }
+
+static NSString* mvkDTRMSLLibraryDiskCacheFilterPath() {
+	const char* env = getenv("MVK_DTR_MSL_LIBRARY_DISK_CACHE_FILTER_PATH");
+	if ( !env || !*env ) { return nil; }
+	return [[NSString stringWithUTF8String: env] stringByExpandingTildeInPath];
+}
+
+static uint32_t mvkDTRShaderResourceLogMinCount() {
+	const char* env = getenv("MVK_DTR_SHADER_RESOURCE_LOG_MIN_COUNT");
+	uint32_t threshold = (env && *env) ? (uint32_t)strtoul(env, nullptr, 10) : 1024;
+	return threshold ? threshold : 1;
+}
+
+static NSString* mvkDTRShaderLogPath() {
+	const char* logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
+	if (logPathEnv && *logPathEnv) {
+		return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath];
+	}
+
+	const char* archivePathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_PATH");
+	if (archivePathEnv && *archivePathEnv) {
+		return [[[NSString stringWithUTF8String: archivePathEnv] stringByExpandingTildeInPath] stringByAppendingString: @".log"];
+	}
+
+	NSArray<NSString*>* cacheDirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+	NSString* cacheRoot = cacheDirs.count ? cacheDirs[0] : [NSHomeDirectory() stringByAppendingPathComponent: @"Library/Caches"];
+	return [[cacheRoot stringByAppendingPathComponent: @"MoltenVK"] stringByAppendingPathComponent: @"detroit-binary-archive.log"];
+}
+
+static void mvkDTRShaderLog(const char* fmt, ...) __printflike(1, 2);
+static void mvkDTRShaderLog(const char* fmt, ...) {
+	char msg[2048];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, args);
+	va_end(args);
+
+	static mutex logLock;
+	lock_guard<mutex> lock(logLock);
+	@autoreleasepool {
+		NSString* logPath = mvkDTRShaderLogPath();
+		NSString* logDir = [logPath stringByDeletingLastPathComponent];
+		[[NSFileManager defaultManager] createDirectoryAtPath: logDir withIntermediateDirectories: YES attributes: nil error: nil];
+
+		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
+		if ( !logFile ) { return; }
+
+		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
+		fprintf(logFile, "%s %s%s\n", timestamp.UTF8String, MVK_DTR_SHADER_LOG_PREFIX, msg);
+		fclose(logFile);
+	}
+}
+
+static const char* mvkDTRInferMSLStage(const string& msl) {
+	if (msl.find("fragment ") != string::npos) { return "fragment"; }
+	if (msl.find("vertex ") != string::npos) { return "vertex"; }
+	if (msl.find("kernel ") != string::npos) { return "compute"; }
+	return "unknown";
+}
+
+static const char* mvkDTRShaderStageName(spv::ExecutionModel stage) {
+	switch (stage) {
+		case spv::ExecutionModelVertex: return "vertex";
+		case spv::ExecutionModelTessellationControl: return "tess-control";
+		case spv::ExecutionModelTessellationEvaluation: return "tess-eval";
+		case spv::ExecutionModelFragment: return "fragment";
+		case spv::ExecutionModelGLCompute: return "compute";
+		default: return "unknown";
+	}
+}
+
+static void mvkDTRLogLargeShaderResources(const SPIRVToMSLConversionConfiguration* pShaderConfig,
+										   const SPIRVToMSLConversionResult& conversionResult,
+										   size_t moduleHash) {
+	if ( !mvkDTRShaderResourceLogEnabled() ) { return; }
+
+	uint32_t minCount = mvkDTRShaderResourceLogMinCount();
+	for (const auto& rb : pShaderConfig->resourceBindings) {
+		const auto& rbb = rb.resourceBinding;
+		if (rbb.stage != pShaderConfig->options.entryPointStage || rbb.count < minCount) { continue; }
+
+		mvkDTRShaderLog("large shader resource stage=%s entry=%s module=%016zx set=%u binding=%u count=%u used=%u basetype=%u msl_buffer=%u msl_texture=%u msl_sampler=%u msl_bytes=%zu arg_buffers=%u pad_arg_buffers=%u",
+						 mvkDTRShaderStageName(pShaderConfig->options.entryPointStage),
+						 pShaderConfig->options.entryPointName.c_str(),
+						 moduleHash,
+						 rbb.desc_set,
+						 rbb.binding,
+						 rbb.count,
+						 rb.outIsUsedByShader ? 1 : 0,
+						 (uint32_t)rbb.basetype,
+						 rbb.msl_buffer,
+						 rbb.msl_texture,
+						 rbb.msl_sampler,
+						 conversionResult.msl.size(),
+						 pShaderConfig->options.mslOptions.argument_buffers ? 1 : 0,
+						 pShaderConfig->options.mslOptions.pad_argument_buffer_resources ? 1 : 0);
+	}
+}
+
+static NSString* mvkDTRShaderSlowDumpDir() {
+	const char* dumpDirEnv = getenv("MVK_DTR_SHADER_SLOW_DUMP_DIR");
+	if ( !dumpDirEnv || !*dumpDirEnv ) { return nil; }
+	return [[NSString stringWithUTF8String: dumpDirEnv] stringByExpandingTildeInPath];
+}
+
+static void mvkDTRDumpSlowShader(const string& msl, const char* stage, size_t mslHash, uint64_t compileNanos) {
+	NSString* dumpDir = mvkDTRShaderSlowDumpDir();
+	if ( !dumpDir ) { return; }
+
+	@autoreleasepool {
+		[[NSFileManager defaultManager] createDirectoryAtPath: dumpDir withIntermediateDirectories: YES attributes: nil error: nil];
+		NSString* fileName = [NSString stringWithFormat: @"slow-%s-%016zx-%.0fms.metal", stage, mslHash, (double)compileNanos / 1e6];
+		NSString* filePath = [dumpDir stringByAppendingPathComponent: fileName];
+		FILE* file = fopen(filePath.fileSystemRepresentation, "wb");
+		if ( !file ) { return; }
+		fwrite(msl.data(), 1, msl.size(), file);
+		fclose(file);
+		mvkDTRShaderLog("slow shader source dumped path=%s", filePath.UTF8String);
+	}
+}
+
+struct MVKDTRMSLLibraryCacheKey {
+	const void* device = nullptr;
+	uint64_t deviceRegistryID = 0;
+	size_t deviceNameHash = 0;
+	size_t mslHash = 0;
+	size_t mslSize = 0;
+	size_t macroHash = 0;
+	size_t macroCount = 0;
+	uint32_t fpFastMathFlags = 0;
+	bool isPositionInvariant = false;
+
+	bool operator==(const MVKDTRMSLLibraryCacheKey& other) const {
+		return device == other.device &&
+			   deviceRegistryID == other.deviceRegistryID &&
+			   deviceNameHash == other.deviceNameHash &&
+			   mslHash == other.mslHash &&
+			   mslSize == other.mslSize &&
+			   macroHash == other.macroHash &&
+			   macroCount == other.macroCount &&
+			   fpFastMathFlags == other.fpFastMathFlags &&
+			   isPositionInvariant == other.isPositionInvariant;
+	}
+};
+
+struct MVKDTRMSLLibraryCacheKeyHasher {
+	size_t operator()(const MVKDTRMSLLibraryCacheKey& key) const {
+		size_t h = key.mslHash;
+		h ^= (size_t)key.deviceRegistryID + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= key.deviceNameHash + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= key.mslSize + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= key.macroHash + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= key.macroCount + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= (size_t)key.fpFastMathFlags + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= (uintptr_t)key.device + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= (size_t)key.isPositionInvariant + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		return h;
+	}
+};
+
+struct MVKDTRMSLLibraryCacheEntry {
+	~MVKDTRMSLLibraryCacheEntry() { [library release]; }
+
+	mutex lock;
+	condition_variable cv;
+	id<MTLLibrary> library = nil;
+	bool compiling = true;
+};
+
+using MVKDTRMSLLibraryCache = unordered_map<MVKDTRMSLLibraryCacheKey, shared_ptr<MVKDTRMSLLibraryCacheEntry>, MVKDTRMSLLibraryCacheKeyHasher>;
+
+static MVKDTRMSLLibraryCache& mvkDTRMSLLibraryCache() {
+	static MVKDTRMSLLibraryCache cache;
+	return cache;
+}
+
+static mutex& mvkDTRMSLLibraryCacheLock() {
+	static mutex cacheLock;
+	return cacheLock;
+}
+
+static size_t mvkDTRHashMSLMacros(const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& macroDef) {
+	size_t h = macroDef.size();
+	for (const auto& md : macroDef) {
+		h ^= mvkHash(md.first.name.data(), md.first.name.size()) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= (size_t)md.first.isFloat + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= (size_t)md.first.isSigned + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= md.second.value.ui64 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+		h ^= md.second.size + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+	}
+	return h;
+}
+
+static size_t mvkDTRHashMTLDeviceName(id<MTLDevice> mtlDevice) {
+	const char* name = mtlDevice.name ? mtlDevice.name.UTF8String : "";
+	return mvkHash(name, strlen(name));
+}
+
+static bool mvkDTRParseMSLHashLine(const char* line, size_t& mslHash) {
+	const char* hashStart = strstr(line, "msl_hash=");
+	if (hashStart) {
+		hashStart += strlen("msl_hash=");
+	} else {
+		hashStart = line;
+		while (*hashStart && !isxdigit((unsigned char)*hashStart)) { hashStart++; }
+	}
+
+	if ( !isxdigit((unsigned char)*hashStart) ) { return false; }
+	char* hashEnd = nullptr;
+	unsigned long long parsedHash = strtoull(hashStart, &hashEnd, 16);
+	if (hashEnd == hashStart) { return false; }
+	mslHash = (size_t)parsedHash;
+	return true;
+}
+
+static const unordered_set<size_t>* mvkDTRMSLLibraryDiskCacheFilter() {
+	static bool enabled = false;
+	static unordered_set<size_t> hashes;
+	static once_flag initOnce;
+
+	call_once(initOnce, [&] {
+		@autoreleasepool {
+			NSString* filterPath = mvkDTRMSLLibraryDiskCacheFilterPath();
+			if ( !filterPath ) { return; }
+			enabled = true;
+
+			FILE* filterFile = fopen(filterPath.fileSystemRepresentation, "r");
+			if ( !filterFile ) {
+				if (mvkDTRShaderCacheLogEnabled()) {
+					mvkDTRShaderLog("MSL disk library cache filter open failed path=%s", filterPath.UTF8String);
+				}
+				return;
+			}
+
+			char line[512];
+			while (fgets(line, sizeof(line), filterFile)) {
+				size_t mslHash = 0;
+				if (mvkDTRParseMSLHashLine(line, mslHash)) { hashes.insert(mslHash); }
+			}
+			fclose(filterFile);
+
+			if (mvkDTRShaderCacheLogEnabled()) {
+				mvkDTRShaderLog("MSL disk library cache filter loaded path=%s hashes=%zu", filterPath.UTF8String, hashes.size());
+			}
+		}
+	});
+
+	return enabled ? &hashes : nullptr;
+}
+
+static bool mvkDTRMSLLibraryDiskCacheAllowsKey(const MVKDTRMSLLibraryCacheKey& key) {
+	const unordered_set<size_t>* filter = mvkDTRMSLLibraryDiskCacheFilter();
+	return !filter || filter->count(key.mslHash) != 0;
+}
+
+static bool mvkDTRMSLLibraryDiskCacheShouldDumpSource(const MVKDTRMSLLibraryCacheKey& key, uint64_t compileNanos) {
+	if ( !mvkDTRMSLLibraryDiskCacheEnabled() || key.macroCount != 0 ) { return false; }
+
+	const unordered_set<size_t>* filter = mvkDTRMSLLibraryDiskCacheFilter();
+	if ( !filter || filter->count(key.mslHash) != 0 ) { return true; }
+
+	return compileNanos >= mvkDTRShaderSlowCompileThresholdNS();
+}
+
+static NSString* mvkDTRMSLLibraryDiskCacheBaseName(const MVKDTRMSLLibraryCacheKey& key) {
+	char name[256];
+	snprintf(name, sizeof(name), "msl-v1-d%016llx-n%016zx-h%016zx-s%zx-m%016zx-c%zx-f%08x-i%u",
+			 (unsigned long long)key.deviceRegistryID,
+			 key.deviceNameHash,
+			 key.mslHash,
+			 key.mslSize,
+			 key.macroHash,
+			 key.macroCount,
+			 key.fpFastMathFlags,
+			 key.isPositionInvariant ? 1 : 0);
+	return [NSString stringWithUTF8String: name];
+}
+
+static NSString* mvkDTRMSLLibraryDiskCachePath(const MVKDTRMSLLibraryCacheKey& key, NSString* extension) {
+	NSString* cacheDir = mvkDTRMSLLibraryDiskCacheDir();
+	if ( !cacheDir ) { return nil; }
+	NSString* fileName = [mvkDTRMSLLibraryDiskCacheBaseName(key) stringByAppendingPathExtension: extension];
+	return [cacheDir stringByAppendingPathComponent: fileName];
+}
+
+static id<MTLLibrary> mvkDTRLoadMSLLibraryFromDisk(id<MTLDevice> mtlDevice,
+											 const MVKDTRMSLLibraryCacheKey& key,
+											 uint64_t& loadNanos) {
+	loadNanos = 0;
+	if ( !mvkDTRMSLLibraryDiskCacheEnabled() || key.macroCount != 0 || !mvkDTRMSLLibraryDiskCacheAllowsKey(key) ) { return nil; }
+
+	@autoreleasepool {
+		NSString* metallibPath = mvkDTRMSLLibraryDiskCachePath(key, @"metallib");
+		if ( ![[NSFileManager defaultManager] fileExistsAtPath: metallibPath] ) { return nil; }
+
+		NSError* error = nil;
+		uint64_t start = mvkGetTimestamp();
+		id<MTLLibrary> lib = [mtlDevice newLibraryWithURL: [NSURL fileURLWithPath: metallibPath] error: &error];
+		loadNanos = mvkGetElapsedNanoseconds(start);
+		if (lib) {
+			if (mvkDTRShaderCacheLogEnabled()) {
+				mvkDTRShaderLog("MSL disk library cache hit path=%s msl_hash=%016zx msl_bytes=%zu load=%.1fms",
+								 metallibPath.UTF8String,
+								 key.mslHash,
+								 key.mslSize,
+								 (double)loadNanos / 1e6);
+			}
+			return lib;
+		}
+
+		if (mvkDTRShaderCacheLogEnabled()) {
+			mvkDTRShaderLog("MSL disk library cache load failed path=%s msl_hash=%016zx error=%s",
+							 metallibPath.UTF8String,
+							 key.mslHash,
+							 error ? error.localizedDescription.UTF8String : "<unknown>");
+		}
+		return nil;
+	}
+}
+
+static void mvkDTRDumpMSLLibraryDiskCacheSource(const MVKDTRMSLLibraryCacheKey& key, const string& msl, uint64_t compileNanos) {
+	if ( !mvkDTRMSLLibraryDiskCacheShouldDumpSource(key, compileNanos) ) { return; }
+
+	static mutex dumpLock;
+	lock_guard<mutex> lock(dumpLock);
+	@autoreleasepool {
+		NSString* cacheDir = mvkDTRMSLLibraryDiskCacheDir();
+		[[NSFileManager defaultManager] createDirectoryAtPath: cacheDir withIntermediateDirectories: YES attributes: nil error: nil];
+
+		NSString* metalPath = mvkDTRMSLLibraryDiskCachePath(key, @"metal");
+		if ( ![[NSFileManager defaultManager] fileExistsAtPath: metalPath] ) {
+			FILE* metalFile = fopen(metalPath.fileSystemRepresentation, "wb");
+			if (metalFile) {
+				fwrite(msl.data(), 1, msl.size(), metalFile);
+				fclose(metalFile);
+			}
+		}
+
+		NSString* metaPath = mvkDTRMSLLibraryDiskCachePath(key, @"meta");
+		if ( ![[NSFileManager defaultManager] fileExistsAtPath: metaPath] ) {
+			NSString* metallibPath = mvkDTRMSLLibraryDiskCachePath(key, @"metallib");
+			FILE* metaFile = fopen(metaPath.fileSystemRepresentation, "wb");
+			if (metaFile) {
+				fprintf(metaFile, "metal=%s\n", metalPath.UTF8String);
+				fprintf(metaFile, "metallib=%s\n", metallibPath.UTF8String);
+				fprintf(metaFile, "msl_hash=%016zx\n", key.mslHash);
+				fprintf(metaFile, "msl_bytes=%zu\n", key.mslSize);
+				fprintf(metaFile, "fp_fast_math_flags=%u\n", key.fpFastMathFlags);
+				fprintf(metaFile, "is_position_invariant=%u\n", key.isPositionInvariant ? 1 : 0);
+				fprintf(metaFile, "macro_count=%zu\n", key.macroCount);
+				fprintf(metaFile, "command_hint=xcrun -sdk macosx metal -o '%s' '%s'\n",
+						metallibPath.UTF8String,
+						metalPath.UTF8String);
+				fclose(metaFile);
+			}
+		}
+	}
+}
+
+static shared_ptr<MVKDTRMSLLibraryCacheEntry> mvkDTRGetMSLLibraryCacheEntry(const MVKDTRMSLLibraryCacheKey& key,
+															 bool& shouldCompile) {
+	lock_guard<mutex> lock(mvkDTRMSLLibraryCacheLock());
+	auto& cache = mvkDTRMSLLibraryCache();
+	auto iter = cache.find(key);
+	if (iter != cache.end()) {
+		shouldCompile = false;
+		return iter->second;
+	}
+
+	shouldCompile = true;
+	auto entry = make_shared<MVKDTRMSLLibraryCacheEntry>();
+	cache[key] = entry;
+	return entry;
+}
+
+static void mvkDTRRemoveMSLLibraryCacheEntry(const MVKDTRMSLLibraryCacheKey& key,
+											 const shared_ptr<MVKDTRMSLLibraryCacheEntry>& entry) {
+	lock_guard<mutex> lock(mvkDTRMSLLibraryCacheLock());
+	auto& cache = mvkDTRMSLLibraryCache();
+	auto iter = cache.find(key);
+	if (iter != cache.end() && iter->second == entry) { cache.erase(iter); }
+}
+
+static id<MTLLibrary> mvkDTRNewMTLLibrary(MVKShaderLibraryCompiler* slc,
+									 id<MTLDevice> mtlDevice,
+									 NSString* nsSrc,
+									 const string& msl,
+									 const SPIRVToMSLConversionResultInfo& shaderConversionResultInfo,
+									 const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& macroDef,
+									 uint64_t& compileNanos,
+									 bool& cacheHit,
+									 bool& diskCacheHit) {
+	compileNanos = 0;
+	cacheHit = false;
+	diskCacheHit = false;
+	bool processCacheEnabled = mvkDTRMSLLibraryCacheEnabled();
+	bool diskCacheEnabled = mvkDTRMSLLibraryDiskCacheEnabled();
+	if ( !processCacheEnabled && !diskCacheEnabled ) {
+		uint64_t start = mvkGetTimestamp();
+		id<MTLLibrary> lib = slc->newMTLLibrary(nsSrc, shaderConversionResultInfo, macroDef);
+		compileNanos = mvkGetElapsedNanoseconds(start);
+		return lib;
+	}
+
+	MVKDTRMSLLibraryCacheKey key;
+	key.device = mtlDevice;
+	key.deviceRegistryID = mtlDevice.registryID;
+	key.deviceNameHash = mvkDTRHashMTLDeviceName(mtlDevice);
+	key.mslHash = mvkHash(msl.data(), msl.size());
+	key.mslSize = msl.size();
+	key.macroHash = mvkDTRHashMSLMacros(macroDef);
+	key.macroCount = macroDef.size();
+	key.fpFastMathFlags = shaderConversionResultInfo.entryPoint.fpFastMathFlags;
+	key.isPositionInvariant = shaderConversionResultInfo.isPositionInvariant;
+
+	bool shouldCompile = false;
+	auto entry = mvkDTRGetMSLLibraryCacheEntry(key, shouldCompile);
+	if ( !shouldCompile ) {
+		uint64_t waitStart = mvkGetTimestamp();
+		unique_lock<mutex> entryLock(entry->lock);
+		while (entry->compiling) { entry->cv.wait(entryLock); }
+		compileNanos = mvkGetElapsedNanoseconds(waitStart);
+		cacheHit = true;
+		return entry->library ? [entry->library retain] : nil;
+	}
+
+	if (diskCacheEnabled) {
+		id<MTLLibrary> diskLib = mvkDTRLoadMSLLibraryFromDisk(mtlDevice, key, compileNanos);
+		if (diskLib) {
+			diskCacheHit = true;
+			{
+				lock_guard<mutex> entryLock(entry->lock);
+				entry->library = [diskLib retain];
+				entry->compiling = false;
+			}
+			entry->cv.notify_all();
+			return diskLib;
+		}
+	}
+
+	uint64_t start = mvkGetTimestamp();
+	id<MTLLibrary> lib = slc->newMTLLibrary(nsSrc, shaderConversionResultInfo, macroDef);
+	compileNanos = mvkGetElapsedNanoseconds(start);
+	if (lib) { mvkDTRDumpMSLLibraryDiskCacheSource(key, msl, compileNanos); }
+	{
+		lock_guard<mutex> entryLock(entry->lock);
+		entry->library = [lib retain];
+		entry->compiling = false;
+	}
+	entry->cv.notify_all();
+	if ( !lib ) { mvkDTRRemoveMSLLibraryCacheEntry(key, entry); }
+	return lib;
+}
 
 MVKMTLFunction::MVKMTLFunction(id<MTLFunction> mtlFunc, const SPIRVToMSLConversionResultInfo scRslts, MTLSize tgSize) {
 	_mtlFunction = [mtlFunc retain];		// retained
@@ -241,7 +748,43 @@ void MVKShaderLibrary::compileLibrary(const string& msl,
 		}
 	}
 
-	_mtlLibrary = slc->newMTLLibrary(nsSrc, _shaderConversionResultInfo, macro_def);	// retained
+	uint64_t dtrCompileNanos = 0;
+	bool dtrMSLLibraryCacheHit = false;
+	bool dtrMSLLibraryDiskCacheHit = false;
+	_mtlLibrary = mvkDTRNewMTLLibrary(slc, getMTLDevice(), nsSrc, msl, _shaderConversionResultInfo, macro_def, dtrCompileNanos, dtrMSLLibraryCacheHit, dtrMSLLibraryDiskCacheHit);	// retained
+	if (mvkDTRShaderCacheLogEnabled() && dtrMSLLibraryDiskCacheHit) {
+		size_t mslHash = mvkHash(msl.data(), msl.size());
+		mvkDTRShaderLog("MSL library disk cache hit entry=%s msl_hash=%016zx msl_bytes=%zu macro_count=%zu load=%.1fms success=%s",
+						_shaderConversionResultInfo.entryPoint.mtlFunctionName.c_str(),
+						mslHash,
+						msl.size(),
+						macro_def.size(),
+						(double)dtrCompileNanos / 1e6,
+						_mtlLibrary ? "1" : "0");
+	}
+	if (mvkDTRShaderCacheLogEnabled() && dtrMSLLibraryCacheHit) {
+		size_t mslHash = mvkHash(msl.data(), msl.size());
+		mvkDTRShaderLog("MSL library cache hit entry=%s msl_hash=%016zx msl_bytes=%zu macro_count=%zu wait=%.1fms success=%s",
+						_shaderConversionResultInfo.entryPoint.mtlFunctionName.c_str(),
+						mslHash,
+						msl.size(),
+						macro_def.size(),
+						(double)dtrCompileNanos / 1e6,
+						_mtlLibrary ? "1" : "0");
+	}
+	if (mvkDTRShaderCacheLogEnabled() && !dtrMSLLibraryCacheHit && !dtrMSLLibraryDiskCacheHit && dtrCompileNanos >= mvkDTRShaderSlowCompileThresholdNS()) {
+		size_t mslHash = mvkHash(msl.data(), msl.size());
+		const char* stage = mvkDTRInferMSLStage(msl);
+		mvkDTRShaderLog("slow Metal library compile stage=%s entry=%s msl_hash=%016zx msl_bytes=%zu macro_count=%zu elapsed=%.1fms success=%s",
+						stage,
+						_shaderConversionResultInfo.entryPoint.mtlFunctionName.c_str(),
+						mslHash,
+						msl.size(),
+						macro_def.size(),
+						(double)dtrCompileNanos / 1e6,
+						_mtlLibrary ? "1" : "0");
+		mvkDTRDumpSlowShader(msl, stage, mslHash, dtrCompileNanos);
+	}
 	[nsSrc release];														// release temp string
 	slc->destroy();
 }
@@ -424,6 +967,7 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
 	uint64_t startTime = getPerformanceTimestamp();
 	bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);
 	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
+	if (wasConverted) { mvkDTRLogLargeShaderResources(pShaderConfig, conversionResult, _key.codeHash); }
 
 	const char* dumpDir = getMVKConfig().shaderDumpDir;
 	if (dumpDir && *dumpDir) {
@@ -741,4 +1285,3 @@ bool MVKFunctionSpecializer::compileComplete(id<MTLFunction> mtlFunction, NSErro
 MVKFunctionSpecializer::~MVKFunctionSpecializer() {
 	[_mtlFunction release];
 }
-

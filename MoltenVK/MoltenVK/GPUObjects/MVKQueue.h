@@ -32,6 +32,7 @@ class MVKQueue;
 class MVKQueueSubmission;
 class MVKPhysicalDevice;
 class MVKGPUCaptureScope;
+class MVKSwapchain;
 
 
 #pragma mark -
@@ -314,9 +315,11 @@ public:
 	MVKQueuePresentSurfaceSubmission(MVKQueue* queue,
 									 const VkPresentInfoKHR* pPresentInfo);
 
+	~MVKQueuePresentSurfaceSubmission() override;
+
 protected:
 	void finish() override;
 
 	MVKSmallVector<MVKImagePresentInfo, 4> _presentInfo;
+	MVKSmallVector<MVKSwapchain*, 4> _presentSwapchains;
 };
-
