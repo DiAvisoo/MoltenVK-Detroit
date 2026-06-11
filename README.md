@@ -4,6 +4,8 @@ Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver Preview**.
 
 This build fixes the fullscreen/windowed crash and flicker bug and enables the Metal shader cache by default. The first setup pass still needs a fresh Detroit `ShaderCache`, but after the Metal cache is built you should not need to delete Detroit's `ShaderCache` folder again. Without this patched MoltenVK, starting the game can take around 20 minutes depending on hardware. After the cache is built, startup should take less than 20 seconds.
 
+Video demo here: https://youtu.be/nvS6Yhe2FEE
+
 It builds on the work in [alexdremov/MoltenVK](https://github.com/alexdremov/MoltenVK), [alexdremov/SPIRV-Cross](https://github.com/alexdremov/SPIRV-Cross), and the great research in [KhronosGroup/MoltenVK#2054](https://github.com/KhronosGroup/MoltenVK/issues/2054).
 
 ## Detroit Install
