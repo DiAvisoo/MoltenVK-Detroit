@@ -77,6 +77,13 @@ After that finishes, quit the game and run:
 Scripts/compile_msl_library_cache.sh
 ```
 
+Note that you can specify how many cores you want to use to the script when generating the .metallib-files. Like so:
+```sh
+./compile_msl_library_cache.sh -j 10
+```
+
+That would use 10 cores and speed up the process.
+
 This precompiles the Metal source files MoltenVK saved into `.metallib` files. It also takes some time, but after it finishes Detroit should launch in under 20 seconds on future starts. Do not delete Detroit's `ShaderCache` folder for normal future launches after this script has completed.
 
 When launching with the finished cache, there may be no visible game window for about 20 seconds. Be patient; the window should appear once the cached Metal libraries are loaded.
