@@ -8,6 +8,14 @@ Video demo here: https://youtu.be/nvS6Yhe2FEE
 
 It builds on the work in [alexdremov/MoltenVK](https://github.com/alexdremov/MoltenVK), [alexdremov/SPIRV-Cross](https://github.com/alexdremov/SPIRV-Cross), and the great research in [KhronosGroup/MoltenVK#2054](https://github.com/KhronosGroup/MoltenVK/issues/2054).
 
+ Tested on:
+     - Mac Studio M2 Max
+     - 64 GB RAM
+     - macOS Tahoe 26.3.1
+     - Metal 4
+     - CrossOver Preview 20260511 (27.0.0.40479)
+     - Xcode 26.5 build 17F42 for building
+
 ## Detroit Install
 
 1. Quit CrossOver Preview completely.
