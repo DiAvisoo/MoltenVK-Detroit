@@ -50,7 +50,7 @@ static const char* mvkDTRGetEnv(const char* primaryName, const char* fallbackNam
 }
 
 static bool mvkDTRShaderCacheLogEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SHADER_CACHE_LOG", false);
+	return false;
 }
 
 static uint64_t mvkDTRShaderSlowCompileThresholdNS() {
@@ -60,7 +60,7 @@ static uint64_t mvkDTRShaderSlowCompileThresholdNS() {
 }
 
 static bool mvkDTRShaderResourceLogEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SHADER_RESOURCE_LOG", false);
+	return false;
 }
 
 static bool mvkDTRMSLLibraryCacheEnabled() {
@@ -85,50 +85,15 @@ static NSString* mvkDTRMSLLibraryDiskCacheFilterPath() {
 }
 
 static uint32_t mvkDTRShaderResourceLogMinCount() {
-	const char* env = getenv("MVK_DTR_SHADER_RESOURCE_LOG_MIN_COUNT");
-	uint32_t threshold = (env && *env) ? (uint32_t)strtoul(env, nullptr, 10) : 1024;
-	return threshold ? threshold : 1;
+	return 1024;
 }
 
-static NSString* mvkDTRShaderLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) {
-		return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath];
-	}
-
-	const char* archivePathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_PATH");
-	if (archivePathEnv && *archivePathEnv) {
-		return [[[NSString stringWithUTF8String: archivePathEnv] stringByExpandingTildeInPath] stringByAppendingString: @".log"];
-	}
-
-	NSArray<NSString*>* cacheDirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
-	NSString* cacheRoot = cacheDirs.count ? cacheDirs[0] : [NSHomeDirectory() stringByAppendingPathComponent: @"Library/Caches"];
-	return [[cacheRoot stringByAppendingPathComponent: @"MoltenVK"] stringByAppendingPathComponent: @"detroit-binary-archive.log"];
+[[maybe_unused]] static NSString* mvkDTRShaderLogPath() {
+	return nil;
 }
 
-static void mvkDTRShaderLog(const char* fmt, ...) __printflike(1, 2);
-static void mvkDTRShaderLog(const char* fmt, ...) {
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	static mutex logLock;
-	lock_guard<mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRShaderLogPath();
-		NSString* logDir = [logPath stringByDeletingLastPathComponent];
-		[[NSFileManager defaultManager] createDirectoryAtPath: logDir withIntermediateDirectories: YES attributes: nil error: nil];
-
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s %s%s\n", timestamp.UTF8String, MVK_DTR_SHADER_LOG_PREFIX, msg);
-		fclose(logFile);
-	}
-}
+template<typename... Args> static inline void mvkDTRDiscardLogArgs(Args&&...) {}
+#define mvkDTRShaderLog(...) do { if (false) { mvkDTRDiscardLogArgs(__VA_ARGS__); } } while (false)
 
 static const char* mvkDTRInferMSLStage(const string& msl) {
 	if (msl.find("fragment ") != string::npos) { return "fragment"; }
@@ -177,9 +142,7 @@ static void mvkDTRLogLargeShaderResources(const SPIRVToMSLConversionConfiguratio
 }
 
 static NSString* mvkDTRShaderSlowDumpDir() {
-	const char* dumpDirEnv = getenv("MVK_DTR_SHADER_SLOW_DUMP_DIR");
-	if ( !dumpDirEnv || !*dumpDirEnv ) { return nil; }
-	return [[NSString stringWithUTF8String: dumpDirEnv] stringByExpandingTildeInPath];
+	return nil;
 }
 
 static void mvkDTRDumpSlowShader(const string& msl, const char* stage, size_t mslHash, uint64_t compileNanos) {

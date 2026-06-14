@@ -42,123 +42,18 @@
 #include "MVKFoundation.h"
 #include "MVKOSExtensions.h"
 
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <execinfo.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <mutex>
 #include <pthread.h>
-#include <signal.h>
-#include <unistd.h>
 
-
-static bool mvkDTRBoolEnvEnabled(const char* name) {
-	const char* env = getenv(name);
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
-}
-
-static bool mvkDTRSurfaceLogEnabled() {
-	return mvkDTRBoolEnvEnabled("MVK_DTR_SURFACE_LOG");
-}
 
 static bool mvkDTRSurfaceLogAllAPIEnabled() {
-	return mvkDTRBoolEnvEnabled("MVK_DTR_SURFACE_LOG_API_ALL");
+	return false;
 }
 
-static bool mvkDTRCrashLogEnabled() {
-	return mvkDTRBoolEnvEnabled("MVK_DTR_CRASH_LOG");
-}
-
-static uint64_t mvkDTRCurrentThreadID() {
-	uint64_t tid = 0;
-	pthread_threadid_np(pthread_self(), &tid);
-	return tid;
-}
-
-static NSString* mvkDTRSurfaceLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	return @"/tmp/mvk-dtr-surface.log";
-}
-
-static char gMVKDTRCrashLogPath[PATH_MAX] = "/tmp/mvk-dtr-surface.log";
-
-static void mvkDTRCrashSignalHandler(int sig, siginfo_t* sigInfo, void* context) {
-	int fd = open(gMVKDTRCrashLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
-	if (fd >= 0) {
-		char msg[512];
-		int len = snprintf(msg, sizeof(msg), "MVK-DTR-CRASH: signal=%d code=%d addr=%p context=%p\n",
-						   sig, sigInfo ? sigInfo->si_code : 0, sigInfo ? sigInfo->si_addr : nullptr, context);
-		if (len > 0) {
-			size_t msgLen = (len < (int)sizeof(msg)) ? (size_t)len : sizeof(msg) - 1;
-			write(fd, msg, msgLen);
-		}
-		void* frames[128];
-		int frameCnt = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
-		backtrace_symbols_fd(frames, frameCnt, fd);
-		write(fd, "MVK-DTR-CRASH: end\n", 19);
-		close(fd);
-	}
-	signal(sig, SIG_DFL);
-	raise(sig);
-}
-
-static void mvkDTRInstallCrashHandlersIfNeeded() {
-	static std::once_flag crashHandlerOnce;
-	std::call_once(crashHandlerOnce, []{
-		if ( !mvkDTRCrashLogEnabled() ) { return; }
-		@autoreleasepool {
-			NSString* logPath = mvkDTRSurfaceLogPath();
-			[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
-			snprintf(gMVKDTRCrashLogPath, sizeof(gMVKDTRCrashLogPath), "%s", logPath.fileSystemRepresentation);
-		}
-
-		struct sigaction action = {};
-		action.sa_sigaction = mvkDTRCrashSignalHandler;
-		sigemptyset(&action.sa_mask);
-		action.sa_flags = SA_SIGINFO | SA_RESETHAND;
-		sigaction(SIGABRT, &action, nullptr);
-		sigaction(SIGBUS, &action, nullptr);
-		sigaction(SIGILL, &action, nullptr);
-		sigaction(SIGSEGV, &action, nullptr);
-		sigaction(SIGTRAP, &action, nullptr);
-	});
-}
-
-static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
-static void mvkDTRSurfaceLog(const char* fmt, ...) {
-	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
-	mvkDTRInstallCrashHandlersIfNeeded();
-
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	static std::mutex logLock;
-	std::lock_guard<std::mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRSurfaceLogPath();
-		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s MVK-DTR-API tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
-		fclose(logFile);
-	}
-}
+template<typename... Args> static inline void mvkDTRDiscardLogArgs(Args&&...) {}
+#define mvkDTRSurfaceLog(...) do { if (false) { mvkDTRDiscardLogArgs(__VA_ARGS__); } } while (false)
 
 
 #pragma mark -

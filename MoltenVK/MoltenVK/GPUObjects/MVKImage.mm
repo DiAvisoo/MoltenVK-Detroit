@@ -38,138 +38,59 @@ using namespace std;
 using namespace SPIRV_CROSS_NAMESPACE;
 
 
-static bool mvkDTRBoolEnvValue(const char* name, bool defaultValue) {
-	const char* env = getenv(name);
-	if ( !env ) { return defaultValue; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env == '0') { return false; }
-	if (*env == '1') { return true; }
-	return defaultValue;
-}
-
 static bool mvkDTRSurfaceLogEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG", false);
+	return false;
 }
 
-static bool mvkDTRSurfaceLogAllImagesEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG_ALL_IMAGES", false);
+[[maybe_unused]] static bool mvkDTRSurfaceLogAllImagesEnabled() {
+	return false;
 }
 
 static bool mvkDTRSkipPresentedHandlerEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_PRESENTED_HANDLER", false);
-}
-
-static bool mvkDTRSkipDrawablePresentEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT", false);
-}
-
-static bool mvkDTRSkipDrawablePresentAfterModeSwitchEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT_AFTER_MODE_SWITCH", false);
+	return false;
 }
 
 static bool mvkDTRLeakPresentCompletionObjectsEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_LEAK_PRESENT_COMPLETION_OBJECTS", false);
+	return false;
 }
 
 static bool mvkDTRRetainDrawableUntilPresentedEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_RETAIN_DRAWABLE_UNTIL_PRESENTED", true);
+	return false;
 }
 
 static bool mvkDTRSkipPresentCompletedHandlerEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_PRESENT_COMPLETED_HANDLER", false);
+	return false;
 }
 
 static bool mvkDTRSkipPresentScheduledHandlerEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SKIP_PRESENT_SCHEDULED_HANDLER", false);
+	return false;
 }
 
 static bool mvkDTRCatchImageMemoryDtorExceptionsEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_CATCH_IMAGE_MEMORY_DTOR_EXCEPTIONS", false);
+	return false;
 }
 
-static uint64_t mvkDTRCurrentThreadID() {
+[[maybe_unused]] static uint64_t mvkDTRCurrentThreadID() {
 	uint64_t tid = 0;
 	pthread_threadid_np(pthread_self(), &tid);
 	return tid;
 }
 
-static uint32_t mvkDTRUIntEnvValue(const char* name) {
-	const char* env = getenv(name);
-	if ( !env ) { return 0; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	char* end = nullptr;
-	unsigned long val = strtoul(env, &end, 10);
-	while (end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) { end++; }
-	return (end && *end == '\0') ? (uint32_t)val : 0;
-}
-
 static bool mvkDTRShouldSkipDrawablePresent(VkExtent2D extent) {
-	if (mvkDTRSkipDrawablePresentEnabled()) { return true; }
-	if ( !mvkDTRSkipDrawablePresentAfterModeSwitchEnabled() ) { return false; }
-
-	static mutex extentLock;
-	static bool hasExtent = false;
-	static uint32_t lastWidth = 0;
-	static uint32_t lastHeight = 0;
-	static bool sawModeSwitch = false;
-	lock_guard<mutex> lock(extentLock);
-
-	if ( !extent.width || !extent.height ) { return false; }
-	if ( !hasExtent ) {
-		hasExtent = true;
-		lastWidth = extent.width;
-		lastHeight = extent.height;
-		return false;
-	}
-	if (extent.width != lastWidth || extent.height != lastHeight) {
-		sawModeSwitch = true;
-		lastWidth = extent.width;
-		lastHeight = extent.height;
-	}
-
-	uint32_t minWidth = mvkDTRUIntEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT_MIN_WIDTH");
-	uint32_t minHeight = mvkDTRUIntEnvValue("MVK_DTR_SKIP_DRAWABLE_PRESENT_MIN_HEIGHT");
-	return sawModeSwitch && extent.width >= minWidth && extent.height >= minHeight;
+	(void)extent;
+	return false;
 }
 
-static NSString* mvkDTRSurfaceLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	return @"/tmp/mvk-dtr-surface.log";
+[[maybe_unused]] static NSString* mvkDTRSurfaceLogPath() {
+	return nil;
 }
 
-static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
-static void mvkDTRSurfaceLog(const char* fmt, ...) {
-	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
-
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	static mutex logLock;
-	lock_guard<mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRSurfaceLogPath();
-		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s MVK-DTR-IMAGE tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
-		fclose(logFile);
-	}
-}
+template<typename... Args> static inline void mvkDTRDiscardLogArgs(Args&&...) {}
+#define mvkDTRSurfaceLog(...) do { if (false) { mvkDTRDiscardLogArgs(__VA_ARGS__); } } while (false)
 
 static bool mvkDTRShouldLogSwapchainImage(MVKSwapchain* swapchain) {
-	if ( !mvkDTRSurfaceLogEnabled() || !swapchain ) { return false; }
-	if ( mvkDTRSurfaceLogAllImagesEnabled() ) { return true; }
-	VkExtent2D extent = swapchain->getImageExtent();
-	return extent.width >= 3000 || extent.height >= 1500;
+	(void)swapchain;
+	return false;
 }
 
 #pragma mark -

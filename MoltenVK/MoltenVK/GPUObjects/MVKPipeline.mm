@@ -47,58 +47,19 @@ using namespace std;
 using namespace mvk;
 using namespace SPIRV_CROSS_NAMESPACE;
 
-
+#if 0
 #define MVK_DTR_BINARY_ARCHIVE_LOG_PREFIX "MVK-DTR-BINARY-ARCHIVE: "
 #define MVK_DTR_BINARY_ARCHIVE_SERIALIZE_INTERVAL 500
 
-static NSString* mvkDTRBinaryArchiveLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) {
-		return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath];
-	}
-
-	const char* archivePathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_PATH");
-	if (archivePathEnv && *archivePathEnv) {
-		return [[[NSString stringWithUTF8String: archivePathEnv] stringByExpandingTildeInPath] stringByAppendingString: @".log"];
-	}
-
-	NSArray<NSString*>* cacheDirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
-	NSString* cacheRoot = cacheDirs.count ? cacheDirs[0] : [NSHomeDirectory() stringByAppendingPathComponent: @"Library/Caches"];
-	return [[cacheRoot stringByAppendingPathComponent: @"MoltenVK"] stringByAppendingPathComponent: @"detroit-binary-archive.log"];
-}
-
-static void mvkDTRBinaryArchiveLog(MVKConfigLogLevel logLevel, const char* fmt, ...) __printflike(2, 3);
-static void mvkDTRBinaryArchiveLog(MVKConfigLogLevel logLevel, const char* fmt, ...) {
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	const char* stderrLevel = logLevel <= MVK_CONFIG_LOG_LEVEL_WARNING ? "warning" : "info";
-	fprintf(stderr, "[mvk-%s] %s%s\n", stderrLevel, MVK_DTR_BINARY_ARCHIVE_LOG_PREFIX, msg);
-
-	static mutex logLock;
-	lock_guard<mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRBinaryArchiveLogPath();
-		NSString* logDir = [logPath stringByDeletingLastPathComponent];
-		[[NSFileManager defaultManager] createDirectoryAtPath: logDir withIntermediateDirectories: YES attributes: nil error: nil];
-
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s %s%s\n", timestamp.UTF8String, MVK_DTR_BINARY_ARCHIVE_LOG_PREFIX, msg);
-		fclose(logFile);
-	}
+[[maybe_unused]] static NSString* mvkDTRBinaryArchiveLogPath() {
+	return nil;
 }
 
 #define MVK_DTR_BINARY_ARCHIVE_LOG_INFO(fmt, ...) \
-	mvkDTRBinaryArchiveLog(MVK_CONFIG_LOG_LEVEL_INFO, fmt, ##__VA_ARGS__)
+	((void)0)
 
 #define MVK_DTR_BINARY_ARCHIVE_LOG_WARN(fmt, ...) \
-	mvkDTRBinaryArchiveLog(MVK_CONFIG_LOG_LEVEL_WARNING, fmt, ##__VA_ARGS__)
+	((void)0)
 
 #define MVK_DTR_SHADER_CACHE_LOG_INTERVAL 100
 #define MVK_DTR_SHADER_CACHE_LOCK_WAIT_NS 1000000ULL
@@ -115,25 +76,11 @@ static const char* mvkDTRShaderStageName(spv::ExecutionModel stage) {
 }
 
 static bool mvkDTRShaderCacheConcurrentCompileEnabled() {
-	const char* env = getenv("MVK_DTR_SHADER_CACHE_CONCURRENT_COMPILE");
-	return !env || strcmp(env, "0") != 0;
+	return true;
 }
 
 static bool mvkDTRArgumentBufferNoPaddingEnabled() {
-	static bool enabled = []() {
-		const char* oldEnv = getenv("MVK_DTR_ARGUMENT_BUFFER_NO_PADDING");
-		if (oldEnv && strcmp(oldEnv, "1") == 0) {
-			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("MVK_DTR_ARGUMENT_BUFFER_NO_PADDING=1 ignored after device-lost testing; use MVK_DTR_ARGUMENT_BUFFER_NO_PADDING_UNSAFE=1 only for targeted diagnostics");
-		}
-
-		const char* env = getenv("MVK_DTR_ARGUMENT_BUFFER_NO_PADDING_UNSAFE");
-		bool isEnabled = env && strcmp(env, "1") == 0;
-		if (isEnabled) {
-			MVK_DTR_BINARY_ARCHIVE_LOG_WARN("argument buffer padding disabled by MVK_DTR_ARGUMENT_BUFFER_NO_PADDING_UNSAFE=1");
-		}
-		return isEnabled;
-	}();
-	return enabled;
+	return false;
 }
 
 class MVKDTRShaderCacheDiagnostics {
@@ -218,12 +165,8 @@ public:
 
 private:
 	MVKDTRShaderCacheDiagnostics() {
-		const char* env = getenv("MVK_DTR_SHADER_CACHE_LOG");
-		_enabled = env && strcmp(env, "1") == 0;
-		_verbose = getenv("MVK_DTR_SHADER_CACHE_VERBOSE") && strcmp(getenv("MVK_DTR_SHADER_CACHE_VERBOSE"), "1") == 0;
-		if (_enabled) {
-			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("shader cache diagnostics enabled%s, concurrent_compile=%s", _verbose ? ", verbose" : "", mvkDTRShaderCacheConcurrentCompileEnabled() ? "1" : "0");
-		}
+		_enabled = false;
+		_verbose = false;
 	}
 
 	void logSummary(const char* label,
@@ -419,19 +362,11 @@ public:
 
 private:
 	MVKDTRBinaryArchiveManager() {
-		const char* enableEnv = getenv("MVK_DTR_BINARY_ARCHIVE_ENABLE");
-		const char* pathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_PATH");
-		const char* populateEnv = getenv("MVK_DTR_BINARY_ARCHIVE_POPULATE");
-		const char* renderEnv = getenv("MVK_DTR_BINARY_ARCHIVE_RENDER_ENABLE");
-		const char* computeEnv = getenv("MVK_DTR_BINARY_ARCHIVE_COMPUTE_ENABLE");
-		_enabled = (enableEnv && strcmp(enableEnv, "0") == 0) ? false : ((enableEnv && strcmp(enableEnv, "1") == 0) || (pathEnv && *pathEnv));
-		_populate = populateEnv && strcmp(populateEnv, "1") == 0;
-		_enableRender = !renderEnv || strcmp(renderEnv, "0") != 0;
-		_enableCompute = computeEnv && strcmp(computeEnv, "1") == 0;
-		_verbose = getenv("MVK_DTR_BINARY_ARCHIVE_VERBOSE") && strcmp(getenv("MVK_DTR_BINARY_ARCHIVE_VERBOSE"), "1") == 0;
-		if (_enabled) {
-			MVK_DTR_BINARY_ARCHIVE_LOG_INFO("enabled%s%s%s, file log = %s", _populate ? "" : ", attach-only mode", _enableRender ? ", render enabled" : ", render disabled", _enableCompute ? ", compute enabled" : ", compute disabled", mvkDTRBinaryArchiveLogPath().UTF8String);
-		}
+		_enabled = false;
+		_populate = false;
+		_enableRender = false;
+		_enableCompute = false;
+		_verbose = false;
 	}
 
 	bool isRenderAttachDisabled() {
@@ -635,6 +570,15 @@ private:
 	bool _computeRetryLogged = false;
 	bool _unavailableLogged = false;
 };
+#endif
+
+static bool mvkDTRShaderCacheConcurrentCompileEnabled() {
+	return true;
+}
+
+static bool mvkDTRArgumentBufferNoPaddingEnabled() {
+	return false;
+}
 
 
 #pragma mark - MVKPipelineLayout
@@ -1593,12 +1537,6 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPi
 		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
 		plState = plc->newMTLRenderPipelineState(plDesc);	// retained
 		plc->destroy();
-		if ( !plState && MVKDTRBinaryArchiveManager::get().retryRenderWithoutArchive(plDesc) ) {
-			clearConfigurationResult();
-			plc = new MVKRenderPipelineCompiler(this);
-			plState = plc->newMTLRenderPipelineState(plDesc);	// retained
-			plc->destroy();
-		}
 		if ( !plState ) { _hasValidMTLPipelineStates = false; }
 	}
 	return plState;
@@ -1612,12 +1550,6 @@ id<MTLComputePipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLCompute
 		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this, compilerType);
 		plState = plc->newMTLComputePipelineState(plDesc);	// retained
 		plc->destroy();
-		if ( !plState && MVKDTRBinaryArchiveManager::get().retryComputeWithoutArchive(plDesc) ) {
-			clearConfigurationResult();
-			plc = new MVKComputePipelineCompiler(this, compilerType);
-			plState = plc->newMTLComputePipelineState(plDesc);	// retained
-			plc->destroy();
-		}
 		if ( !plState ) { _hasValidMTLPipelineStates = false; }
 	}
 	return plState;
@@ -3191,12 +3123,6 @@ MVKComputePipeline::MVKComputePipeline(MVKDevice* device,
 		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
 		_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
 		plc->destroy();
-		if ( !_mtlPipelineState && MVKDTRBinaryArchiveManager::get().retryComputeWithoutArchive(plDesc) ) {
-			clearConfigurationResult();
-			plc = new MVKComputePipelineCompiler(this);
-			_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
-			plc->destroy();
-		}
 		[plDesc release];															// temp release
 
 		if ( !_mtlPipelineState ) { _hasValidMTLPipelineStates = false; }
@@ -3308,27 +3234,21 @@ MVKShaderLibrary* MVKPipelineCache::getShaderLibrary(SPIRVToMSLConversionConfigu
 		return getShaderLibraryImpl(pContext, shaderModule, pipeline, pShaderFeedback, startTime);
 	}
 
-	MVKDTRShaderCacheDiagnostics& diag = MVKDTRShaderCacheDiagnostics::get();
 	MVKShaderModuleKey smKey = shaderModule->getKey();
 	MVKShaderLibraryCache* slCache = nullptr;
 	MVKShaderLibrary* shLib = nullptr;
 	SPIRVToMSLConversionResult conversionResult;
 
-	uint64_t lockStart = mvkGetTimestamp();
 	unique_lock<mutex> lock(_shaderCacheLock);
-	diag.recordLockWait(mvkGetElapsedNanoseconds(lockStart));
 
 	slCache = getShaderLibraryCache(smKey);
 	shLib = slCache->findShaderLibrary(pContext, pShaderFeedback, startTime);
 	if (shLib) {
-		diag.recordHit(smKey, pContext);
 		if (pShaderFeedback) { mvkEnableFlags(pShaderFeedback->flags, VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT); }
 		return shLib;
 	}
 
-	diag.recordMiss(smKey, pContext, slCache->_shaderLibraries.size());
 	if (pipeline->shouldFailOnPipelineCompileRequired()) {
-		diag.recordCompileSkipped(smKey, pContext);
 		return nullptr;
 	}
 
@@ -3337,20 +3257,15 @@ MVKShaderLibrary* MVKPipelineCache::getShaderLibrary(SPIRVToMSLConversionConfigu
 	if ( !shaderModule->convert(pContext, conversionResult) ) { return nullptr; }
 	lock.unlock();
 
-	uint64_t compileStart = mvkGetTimestamp();
 	MVKShaderLibrary* newShLib = new MVKShaderLibrary(slCache->_owner, conversionResult);
-	uint64_t compileNanos = mvkGetElapsedNanoseconds(compileStart);
 
-	lockStart = mvkGetTimestamp();
 	lock.lock();
-	diag.recordLockWait(mvkGetElapsedNanoseconds(lockStart));
 
 	// Another pipeline creation thread might have populated this shader while Metal was compiling.
 	slCache = getShaderLibraryCache(smKey);
 	shLib = slCache->findShaderLibrary(pContext);
 	if (shLib) {
 		newShLib->destroy();
-		diag.recordDuplicate(smKey, pContext, compileNanos);
 		if (pShaderFeedback) { pShaderFeedback->duration += mvkGetElapsedNanoseconds(startTime); }
 		return shLib;
 	}
@@ -3358,7 +3273,6 @@ MVKShaderLibrary* MVKPipelineCache::getShaderLibrary(SPIRVToMSLConversionConfigu
 	slCache->_shaderLibraries.emplace_back(*pContext, newShLib);
 	markDirty();
 	if (pShaderFeedback) { pShaderFeedback->duration += mvkGetElapsedNanoseconds(startTime); }
-	diag.recordCompiled(smKey, pContext, compileNanos, slCache->_shaderLibraries.size());
 	return newShLib;
 }
 
@@ -3877,9 +3791,6 @@ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(
 
 	compile(lock, ^{
 		auto mtlDev = getMTLDevice();
-		if (_owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
-			MVKDTRBinaryArchiveManager::get().attach(mtlRPLDesc, mtlDev);
-		}
 		@synchronized (mtlDev) {
 			[mtlDev newRenderPipelineStateWithDescriptor: mtlRPLDesc
 									   completionHandler: ^(id<MTLRenderPipelineState> ps, NSError* error) {
@@ -3891,9 +3802,6 @@ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(
 
 	id<MTLRenderPipelineState> mtlRenderPipelineState = [_mtlRenderPipelineState retain];
 	lock.unlock();
-	if (mtlRenderPipelineState && _owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
-		MVKDTRBinaryArchiveManager::get().add(mtlRPLDesc, getMTLDevice());
-	}
 	return mtlRenderPipelineState;
 }
 
@@ -3919,9 +3827,6 @@ id<MTLComputePipelineState> MVKComputePipelineCompiler::newMTLComputePipelineSta
 
 	compile(lock, ^{
 		auto mtlDev = getMTLDevice();
-		if (_owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
-			MVKDTRBinaryArchiveManager::get().attach(plDesc, mtlDev);
-		}
 		@synchronized (mtlDev) {
 			[mtlDev newComputePipelineStateWithDescriptor: plDesc
 												  options: MTLPipelineOptionNone
@@ -3934,9 +3839,6 @@ id<MTLComputePipelineState> MVKComputePipelineCompiler::newMTLComputePipelineSta
 
 	id<MTLComputePipelineState> mtlComputePipelineState = [_mtlComputePipelineState retain];
 	lock.unlock();
-	if (mtlComputePipelineState && _owner->getVkObjectType() == VK_OBJECT_TYPE_PIPELINE) {
-		MVKDTRBinaryArchiveManager::get().add(plDesc, getMTLDevice());
-	}
 	return mtlComputePipelineState;
 }
 

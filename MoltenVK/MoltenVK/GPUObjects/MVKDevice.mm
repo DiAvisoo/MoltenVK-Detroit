@@ -44,8 +44,7 @@
 using namespace std;
 
 static bool mvkDTRForceArgumentEncodersEnabled() {
-	const char* env = getenv("MVK_DTR_FORCE_ARGUMENT_ENCODERS");
-	return env && strcmp(env, "1") == 0;
+	return false;
 }
 
 

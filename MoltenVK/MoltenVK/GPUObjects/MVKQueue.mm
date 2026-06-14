@@ -37,122 +37,54 @@
 using namespace std;
 
 
-static bool mvkDTRSurfaceLogEnabled() {
-	const char* env = getenv("MVK_DTR_SURFACE_LOG");
-	return env && strcmp(env, "1") == 0;
+[[maybe_unused]] static bool mvkDTRSurfaceLogEnabled() {
+	return false;
 }
 
 static bool mvkDTRDeferPresentFinishEnabled() {
-	const char* env = getenv("MVK_DTR_DEFER_PRESENT_FINISH");
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
+	return false;
 }
 
 static bool mvkDTRLeakPresentSubmissionsEnabled() {
-	const char* env = getenv("MVK_DTR_LEAK_PRESENT_SUBMISSIONS");
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
+	return false;
 }
 
 static bool mvkDTRSkipPresentCaptureScopeEnabled() {
-	const char* env = getenv("MVK_DTR_SKIP_PRESENT_CAPTURE_SCOPE");
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
+	return false;
 }
 
 static bool mvkDTRSkipPresentFinishEnabled() {
-	const char* env = getenv("MVK_DTR_SKIP_PRESENT_FINISH");
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
+	return false;
 }
 
 static bool mvkDTRSkipQueuePresentCompletedHandlerEnabled() {
-	const char* env = getenv("MVK_DTR_SKIP_QUEUE_PRESENT_COMPLETED_HANDLER");
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
+	return false;
 }
 
 static bool mvkDTRSkipQueuePresentCommitEnabled() {
-	const char* env = getenv("MVK_DTR_SKIP_QUEUE_PRESENT_COMMIT");
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
+	return false;
 }
 
 static bool mvkDTRWaitForPresentedEnabled() {
-	const char* env = getenv("MVK_DTR_WAIT_FOR_PRESENTED");
-	if ( !env ) { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	if (*env++ != '1') { return false; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	return *env == '\0';
+	return false;
 }
 
 static uint32_t mvkDTRWaitForPresentedTimeoutMS() {
-	const char* env = getenv("MVK_DTR_WAIT_FOR_PRESENTED_TIMEOUT_MS");
-	if ( !env ) { return 250; }
-	while (*env == ' ' || *env == '\t' || *env == '\n' || *env == '\r') { env++; }
-	char* end = nullptr;
-	unsigned long val = strtoul(env, &end, 10);
-	while (end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) { end++; }
-	return (end && *end == '\0') ? (uint32_t)val : 250;
+	return 0;
 }
 
-static uint64_t mvkDTRCurrentThreadID() {
+[[maybe_unused]] static uint64_t mvkDTRCurrentThreadID() {
 	uint64_t tid = 0;
 	pthread_threadid_np(pthread_self(), &tid);
 	return tid;
 }
 
-static NSString* mvkDTRSurfaceLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	return @"/tmp/mvk-dtr-surface.log";
+[[maybe_unused]] static NSString* mvkDTRSurfaceLogPath() {
+	return nil;
 }
 
-static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
-static void mvkDTRSurfaceLog(const char* fmt, ...) {
-	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
-
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	static mutex logLock;
-	lock_guard<mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRSurfaceLogPath();
-		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s MVK-DTR-QUEUE tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
-		fclose(logFile);
-	}
-}
+template<typename... Args> static inline void mvkDTRDiscardLogArgs(Args&&...) {}
+#define mvkDTRSurfaceLog(...) do { if (false) { mvkDTRDiscardLogArgs(__VA_ARGS__); } } while (false)
 
 
 #pragma mark -

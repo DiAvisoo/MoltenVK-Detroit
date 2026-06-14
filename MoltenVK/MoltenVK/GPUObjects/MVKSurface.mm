@@ -79,52 +79,26 @@ static bool mvkDTRSurfaceStableWindowLayerEnabled() {
 	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_STABLE_WINDOW_LAYER", true);
 }
 
-static bool mvkDTRSurfaceLogEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG", false);
+[[maybe_unused]] static bool mvkDTRSurfaceLogEnabled() {
+	return false;
 }
 
 static bool mvkDTRSurfaceLogNativeEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG_NATIVE", false);
+	return false;
 }
 
-static uint64_t mvkDTRCurrentThreadID() {
+[[maybe_unused]] static uint64_t mvkDTRCurrentThreadID() {
 	uint64_t tid = 0;
 	pthread_threadid_np(pthread_self(), &tid);
 	return tid;
 }
 
-static NSString* mvkDTRSurfaceLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	return @"/tmp/mvk-dtr-surface.log";
+[[maybe_unused]] static NSString* mvkDTRSurfaceLogPath() {
+	return nil;
 }
 
-static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
-static void mvkDTRSurfaceLog(const char* fmt, ...) {
-	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
-
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	static std::mutex logLock;
-	std::lock_guard<std::mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRSurfaceLogPath();
-		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s MVK-DTR-SURFACE tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
-		fclose(logFile);
-	}
-}
+template<typename... Args> static inline void mvkDTRDiscardLogArgs(Args&&...) {}
+#define mvkDTRSurfaceLog(...) do { if (false) { mvkDTRDiscardLogArgs(__VA_ARGS__); } } while (false)
 
 static void mvkDTRLogLayerNativeState(const char* stage, const void* surface, CAMetalLayer* layer, const void* activeSwapchain) {
 	if ( !mvkDTRSurfaceLogNativeEnabled() ) { return; }

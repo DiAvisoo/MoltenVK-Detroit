@@ -34,49 +34,22 @@
 using namespace std;
 
 
-static bool mvkDTRMemoryLogEnabled() {
-	const char* env = getenv("MVK_DTR_SURFACE_LOG");
-	return env && strcmp(env, "1") == 0;
+[[maybe_unused]] static bool mvkDTRMemoryLogEnabled() {
+	return false;
 }
 
-static uint64_t mvkDTRCurrentThreadID() {
+[[maybe_unused]] static uint64_t mvkDTRCurrentThreadID() {
 	uint64_t tid = 0;
 	pthread_threadid_np(pthread_self(), &tid);
 	return tid;
 }
 
-static NSString* mvkDTRMemoryLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	return @"/tmp/mvk-dtr-surface.log";
+[[maybe_unused]] static NSString* mvkDTRMemoryLogPath() {
+	return nil;
 }
 
-static void mvkDTRMemoryLog(const char* fmt, ...) __printflike(1, 2);
-static void mvkDTRMemoryLog(const char* fmt, ...) {
-	if ( !mvkDTRMemoryLogEnabled() ) { return; }
-
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	static mutex logLock;
-	lock_guard<mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRMemoryLogPath();
-		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s MVK-DTR-MEMORY tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
-		fclose(logFile);
-	}
-}
+template<typename... Args> static inline void mvkDTRDiscardLogArgs(Args&&...) {}
+#define mvkDTRMemoryLog(...) do { if (false) { mvkDTRDiscardLogArgs(__VA_ARGS__); } } while (false)
 
 
 #pragma mark MVKDeviceMemory

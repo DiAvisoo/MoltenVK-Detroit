@@ -49,12 +49,12 @@ static bool mvkDTRBoolEnvValue(const char* name, bool defaultValue) {
 	return defaultValue;
 }
 
-static bool mvkDTRSurfaceLogEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG", false);
+[[maybe_unused]] static bool mvkDTRSurfaceLogEnabled() {
+	return false;
 }
 
-static bool mvkDTRSurfaceLogAllImagesEnabled() {
-	return mvkDTRBoolEnvValue("MVK_DTR_SURFACE_LOG_ALL_IMAGES", false);
+[[maybe_unused]] static bool mvkDTRSurfaceLogAllImagesEnabled() {
+	return false;
 }
 
 static bool mvkDTRSkipForceUnpresentedCompletionEnabled() {
@@ -79,47 +79,22 @@ static void mvkDTRRunWithDisabledLayerActions(void (^block)(void)) {
 }
 
 static bool mvkDTRShouldLogSwapchainImage(VkExtent2D extent) {
-	return mvkDTRSurfaceLogEnabled() && (mvkDTRSurfaceLogAllImagesEnabled() || extent.width >= 3000 || extent.height >= 1500);
+	(void)extent;
+	return false;
 }
 
-static uint64_t mvkDTRCurrentThreadID() {
+[[maybe_unused]] static uint64_t mvkDTRCurrentThreadID() {
 	uint64_t tid = 0;
 	pthread_threadid_np(pthread_self(), &tid);
 	return tid;
 }
 
-static NSString* mvkDTRSurfaceLogPath() {
-	const char* logPathEnv = getenv("MVK_DTR_SURFACE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	logPathEnv = getenv("MVK_DTR_BINARY_ARCHIVE_LOG_PATH");
-	if (logPathEnv && *logPathEnv) { return [[NSString stringWithUTF8String: logPathEnv] stringByExpandingTildeInPath]; }
-
-	return @"/tmp/mvk-dtr-surface.log";
+[[maybe_unused]] static NSString* mvkDTRSurfaceLogPath() {
+	return nil;
 }
 
-static void mvkDTRSurfaceLog(const char* fmt, ...) __printflike(1, 2);
-static void mvkDTRSurfaceLog(const char* fmt, ...) {
-	if ( !mvkDTRSurfaceLogEnabled() ) { return; }
-
-	char msg[2048];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
-
-	static mutex logLock;
-	lock_guard<mutex> lock(logLock);
-	@autoreleasepool {
-		NSString* logPath = mvkDTRSurfaceLogPath();
-		[[NSFileManager defaultManager] createDirectoryAtPath: [logPath stringByDeletingLastPathComponent] withIntermediateDirectories: YES attributes: nil error: nil];
-		FILE* logFile = fopen(logPath.fileSystemRepresentation, "a");
-		if ( !logFile ) { return; }
-		NSString* timestamp = [[NSDate date] descriptionWithLocale: nil];
-		fprintf(logFile, "%s MVK-DTR-SWAPCHAIN tid=%llu: %s\n", timestamp.UTF8String, (unsigned long long)mvkDTRCurrentThreadID(), msg);
-		fclose(logFile);
-	}
-}
+template<typename... Args> static inline void mvkDTRDiscardLogArgs(Args&&...) {}
+#define mvkDTRSurfaceLog(...) do { if (false) { mvkDTRDiscardLogArgs(__VA_ARGS__); } } while (false)
 
 
 #pragma mark -
