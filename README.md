@@ -16,6 +16,8 @@ It builds on the work in [alexdremov/MoltenVK](https://github.com/alexdremov/Mol
      - CrossOver Preview 20260511 (27.0.0.40479)
      - Xcode 26.5 build 17F42 for building
 
+It's quite laggy compared to the libMoltenVK.dylib shipped with CrossOver Preview though, so the above specs will not be enough.
+
 ## Detroit Install
 
 1. Quit CrossOver Preview completely.
