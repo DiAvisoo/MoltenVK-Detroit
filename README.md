@@ -114,11 +114,6 @@ Default cache folder:
 ## Optional Env Vars
 
 - `VK_DTR_MSL_LIBRARY_DISK_CACHE_DIR=/path/to/cache`: use a different Metal cache folder.
-- `MVK_DTR_MSL_LIBRARY_CACHE=0`: disable the Metal shader cache.
-- `MVK_DTR_SURFACE_LOG=1`: enable MoltenVK diagnostics.
-- `MVK_DTR_SURFACE_LOG_PATH=/path/to/log`: write diagnostics to a custom path.
-- `MVK_DTR_SURFACE_STABLE_WINDOW_LAYER=0`: disable the fullscreen/windowed flicker workaround.
-- `MVK_DTR_RETAIN_DRAWABLE_UNTIL_PRESENTED=0`: disable the drawable-retain safety path.
 
 -----
 
