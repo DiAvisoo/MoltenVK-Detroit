@@ -16,7 +16,7 @@ It builds on the work in [alexdremov/MoltenVK](https://github.com/alexdremov/Mol
      - 64 GB RAM
      - macOS Tahoe 26.3.1
      - Metal 4
-     - CrossOver Preview 20260511 (27.0.0.40479)
+     - CrossOver Preview 20260511 (27.0.0.40479) and on CrossOver 25.1.1 (25.1.1.38624)
      - Xcode 26.5 build 17F42 for building
 
 Runs smooth as silk on the above specs!
