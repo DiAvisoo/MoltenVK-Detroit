@@ -52,7 +52,7 @@ sudo install -m 755 libMoltenVK.dylib "/Applications/CrossOver Preview.app/Conte
 "DEPTH_OF_FIELD": 0
 ```
 
-6. Apply the background blur hex fix to `DetroitBecomeHuman.exe` which causes issues with MoltenVK. (More info here https://38.135.25.20/r/DetroitBecomeHuman/comments/1mnfeva/for_all_pc_players_guide_to_remove_the_background/?__pot=aHR0cHM6Ly93d3cucmVkZGl0LmNvbQ)
+6. Apply the background blur hex fix to `DetroitBecomeHuman.exe` which causes issues with MoltenVK. (More info here https://www.reddit.com/r/DetroitBecomeHuman/comments/1mnfeva/for_all_pc_players_guide_to_remove_the_background/)
 
 Back up the executable first:
 
