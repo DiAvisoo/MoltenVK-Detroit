@@ -7,7 +7,7 @@ Download release v0.0.2: https://github.com/DiAvisoo/MoltenVK-Detroit/releases/t
 This build fixes the fullscreen/windowed crash, fixes the bug where you couldn't change video settings and it also enables the custom Metal shader cache by default. Once the ShaderCache is built the first time, you can quit the game and run the script compile_msl_library_cache.sh (see instructions below) to precompile the Metal Cache.
 The first setup pass still needs a fresh Detroit `ShaderCache`, but after the Metal cache is built (using the script) you should not need to delete Detroit's `ShaderCache` folder again.
 
-Without this patched MoltenVK, the game doesn't start. Also, if you haven't run the script (after having started the game once and let the Compiling Shaders progress finish) it can take around 20 minutes on each start depending on hardware. After the cache is built, startup should take less than 20 seconds.
+Without this patched MoltenVK, the game doesn't start. Also, if you haven't run the script (after having started the game once and let the Compiling Shaders progress finish) it can take around 20 minutes on each start depending on hardware. After the Metallib-cache is built however (using the script once), startup should take less than 20 seconds.
 
 Video demo here https://youtu.be/nvS6Yhe2FEE and here https://www.youtube.com/watch?v=WpMW1ZbnP6U
 
