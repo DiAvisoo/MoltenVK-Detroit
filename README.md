@@ -2,7 +2,7 @@
 
 Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver Preview**.
 
-Download release v0.0.2: https://github.com/DiAvisoo/MoltenVK-Detroit/releases/tag/Release002
+Download release v0.0.3: https://github.com/DiAvisoo/MoltenVK-Detroit/releases/tag/Release003
 
 This build fixes the fullscreen/windowed crash, fixes the bug where you couldn't change video settings and it also enables the custom Metal shader cache by default. Once the ShaderCache is built the first time, you can quit the game and run the script compile_msl_library_cache.sh (see instructions below) to precompile the Metal Cache.
 The first setup pass still needs a fresh Detroit `ShaderCache`, but after the Metal cache is built (using the script) you should not need to delete Detroit's `ShaderCache` folder again.

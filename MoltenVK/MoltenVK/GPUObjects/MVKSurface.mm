@@ -321,6 +321,10 @@ static CAMetalLayer* mvkDTRSurfaceCachedWindowLayer(const void* surface, CAMetal
 				mvkDTRSurfaceLog("window layer cache skipped surface=%p func=%s layer=%p view=%p reason=no_window", surface, vkFuncName, mtlLayer, view);
 				return;
 			}
+			if ( !window.visible || CGRectIsEmpty(view.bounds) || CGRectIsEmpty(window.contentView.bounds) ) {
+				mvkDTRSurfaceLog("window layer cache skipped surface=%p func=%s layer=%p view=%p window=%p reason=window_not_ready", surface, vkFuncName, mtlLayer, view, window);
+				return;
+			}
 
 			NSMapTable* cache = mvkDTRSurfaceWindowLayerCache();
 			CAMetalLayer* cachedLayer = [cache objectForKey: window];
@@ -418,14 +422,13 @@ void MVKSurface::initLayer(CAMetalLayer* mtlLayer, const char* vkFuncName, bool 
 	logNativeState("init layer");
 	if ( !_mtlCAMetalLayer && !isHeadless ) { setConfigurationResult(reportError(VK_ERROR_SURFACE_LOST_KHR, "%s(): On-screen rendering requires a layer of type CAMetalLayer.", vkFuncName)); }
 
-	// Sometimes, the owning view can replace its CAMetalLayer.
-	// When that happens, the app needs to recreate the surface.
-	if ([_mtlCAMetalLayer.delegate isKindOfClass: [PLATFORM_VIEW_CLASS class]]) {
+	// Layer replacement tracking is fragile during CrossOver startup, so keep it opt-in.
+	if (mvkDTRSurfaceReplaceLayerEnabled() && [_mtlCAMetalLayer.delegate isKindOfClass: [PLATFORM_VIEW_CLASS class]]) {
 		_layerObserver = [MVKBlockObserver observerWithBlock: ^(NSString* path, id object, NSDictionary*, void*) {
 			if ([path isEqualToString: @"layer"]) {
 				mvkDTRSurfaceLog("observed view layer change surface=%p object=%p old_layer=%p active_swapchain=%p replace_env=%u", this, object, this->_mtlCAMetalLayer, this->_activeSwapchain, mvkDTRSurfaceReplaceLayerEnabled() ? 1 : 0);
 				this->logNativeState("observed view layer change");
-				if (mvkDTRSurfaceReplaceLayerEnabled() && [object isKindOfClass: [PLATFORM_VIEW_CLASS class]]) {
+				if ([object isKindOfClass: [PLATFORM_VIEW_CLASS class]]) {
 					__block CAMetalLayer* replacementLayer = nil;
 					mvkDispatchToMainAndWait(^{
 						CALayer* viewLayer = ((PLATFORM_VIEW_CLASS*)object).layer;
