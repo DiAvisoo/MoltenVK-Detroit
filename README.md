@@ -1,6 +1,6 @@
 # Detroit: Become Human CrossOver Preview Fix
 
-Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver Preview**.
+Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver**.
 
 Download release v0.0.3: https://github.com/DiAvisoo/MoltenVK-Detroit/releases/tag/Release003
 
