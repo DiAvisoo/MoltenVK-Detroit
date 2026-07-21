@@ -23,6 +23,35 @@ It builds on the work in [alexdremov/MoltenVK](https://github.com/alexdremov/Mol
 
 Runs smooth as silk on the above specs!
 
+Also verified end-to-end on a MacBook Pro with an M5 Max, macOS 26.5.2,
+Metal 4, CrossOver 26.2, and Xcode 26.6 with Metal Toolchain 17F109.
+
+### Recommended: isolate the patched CrossOver app and bottle
+
+Replacing `libMoltenVK.dylib` changes the graphics library for every bottle
+that uses that CrossOver app. To keep an existing CrossOver installation and
+its other bottles untouched, duplicate the app before following the install
+steps. For example, adjust the source path if CrossOver is installed somewhere
+else:
+
+```sh
+mkdir -p "$HOME/Applications"
+ditto --rsrc --extattr \
+  "/Applications/CrossOver.app" \
+  "$HOME/Applications/CrossOver Detroit.app"
+```
+
+Create a separate Windows 10 64-bit bottle for Detroit, or copy an existing
+64-bit Steam bottle with the duplicated app's `cxbottle` tool:
+
+```sh
+"$HOME/Applications/CrossOver Detroit.app/Contents/SharedSupport/CrossOver/bin/cxbottle" \
+  --bottle Detroit --copy ExistingSteamBottle
+```
+
+Use the duplicated app and `Detroit` bottle for every remaining step. This
+makes rollback as simple as returning to the original CrossOver app and bottle.
+
 ## Detroit Install
 
 1. Quit CrossOver Preview completely.
@@ -39,6 +68,19 @@ cp "/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib64/l
 sudo install -m 755 libMoltenVK.dylib "/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib64/libMoltenVK.dylib"
 ```
 
+Replacing a library inside an app invalidates its code signature. If macOS
+refuses to open the modified app, or CrossOver exits immediately, re-sign the
+modified copy and verify it. Do not run this against the original app if using
+the isolated setup above:
+
+```sh
+codesign --force --deep --sign - \
+  --preserve-metadata=identifier,entitlements,flags,runtime \
+  "$HOME/Applications/CrossOver Detroit.app"
+codesign --verify --deep --strict \
+  "$HOME/Applications/CrossOver Detroit.app"
+```
+
 4. Edit the Detroit/Steam bottle's `cxbottle.conf` and add under `[EnvironmentVariables]`:
 
 ```ini
@@ -51,6 +93,10 @@ sudo install -m 755 libMoltenVK.dylib "/Applications/CrossOver Preview.app/Conte
 ```json
 "DEPTH_OF_FIELD": 0
 ```
+
+The first successful GPU benchmark may rewrite this value to `1`. Quit the
+game and check it again before the next launch. If it continues to reset, use a
+launcher or wrapper that sets it to `0` immediately before starting Detroit.
 
 6. Apply the background blur hex fix to `DetroitBecomeHuman.exe` which causes issues with MoltenVK. (More info here https://www.reddit.com/r/DetroitBecomeHuman/comments/1mnfeva/for_all_pc_players_guide_to_remove_the_background/)
 
@@ -92,6 +138,19 @@ After that finishes, quit the game and run:
 Scripts/compile_msl_library_cache.sh
 ```
 
+The script requires Apple's optional Metal Toolchain. If it reports
+`cannot execute tool 'metal' due to missing Metal Toolchain`, initialize Xcode
+and download the component, then rerun the script:
+
+```sh
+xcodebuild -runFirstLaunch
+xcodebuild -downloadComponent MetalToolchain
+xcrun -sdk macosx metal -v
+```
+
+Running `-runFirstLaunch` first also fixes the Xcode plug-in loading error that
+can otherwise prevent `-downloadComponent` from starting.
+
 Note that you can specify how many cores you want to use to the script when generating the .metallib-files. Like so:
 ```sh
 ./compile_msl_library_cache.sh -j 10
@@ -110,6 +169,20 @@ Default cache folder:
 ```text
 ~/Library/Caches/MoltenVK/detroit-msl-library-cache-full
 ```
+
+After compilation, the source and library counts should match:
+
+```sh
+find "$HOME/Library/Caches/MoltenVK/detroit-msl-library-cache-full" \
+  -type f -name '*.metal' | wc -l
+find "$HOME/Library/Caches/MoltenVK/detroit-msl-library-cache-full" \
+  -type f -name '*.metallib' | wc -l
+```
+
+Detroit can generate a small number of additional sources when entering the
+welcome screen or new scenes. If the counts no longer match, quit the game and
+run `compile_msl_library_cache.sh` again. Existing libraries are skipped, so
+only the new sources are compiled.
 
 ## Optional Env Vars
 
