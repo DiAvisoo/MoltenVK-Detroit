@@ -2,6 +2,9 @@
 
 Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver**.
 
+Please follow the guide, on how to install this mod, by Andrew Tsai
+https://www.youtube.com/watch?v=ASHlzBnJDOE
+
 Download release v0.0.3: https://github.com/DiAvisoo/MoltenVK-Detroit/releases/tag/Release003
 
 This build fixes the fullscreen/windowed crash, fixes the bug where you couldn't change video settings and it also enables the custom Metal shader cache by default. Once the ShaderCache is built the first time, you can quit the game and run the script compile_msl_library_cache.sh (see instructions below) to precompile the Metal Cache.
