@@ -2,7 +2,7 @@
 
 Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver**.
 
-Please follow the guide, on how to install this mod, by Andrew Tsai
+Please follow this video guide, on how to install this mod, by Andrew Tsai
 https://www.youtube.com/watch?v=ASHlzBnJDOE
 
 Download release v0.0.3: https://github.com/DiAvisoo/MoltenVK-Detroit/releases/tag/Release003
