@@ -31,6 +31,8 @@ Runs smooth as silk on the above specs!
 Follow the guide by xxMAKMAKxx here:
 https://github.com/KhronosGroup/MoltenVK/issues/2054#issuecomment-5253077239
 
+PDF guide: https://github.com/user-attachments/files/30934778/Detroit_Become_Human_Sikarugir_Step_by_Step.pdf
+
 ## Crossover guide
 
 ## Detroit Install
