@@ -26,6 +26,13 @@ It builds on the work in [alexdremov/MoltenVK](https://github.com/alexdremov/Mol
 
 Runs smooth as silk on the above specs!
 
+## Sikarugir guide
+
+Follow the guide by xxMAKMAKxx here:
+https://github.com/KhronosGroup/MoltenVK/issues/2054#issuecomment-5253077239
+
+## Crossover guide
+
 ## Detroit Install
 
 1. Quit CrossOver Preview completely.
