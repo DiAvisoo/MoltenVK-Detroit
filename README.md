@@ -1,3 +1,8 @@
+# Sidenote
+
+If you're interested, I have created an ebook-reader that is reading reimagined. Check it out!
+https://readmei.com
+
 # Detroit: Become Human CrossOver Preview Fix
 
 Unofficial MoltenVK fix for **Detroit: Become Human** on **CrossOver**.
