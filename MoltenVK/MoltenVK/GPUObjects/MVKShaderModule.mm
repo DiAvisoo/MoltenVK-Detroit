@@ -307,7 +307,10 @@ static bool mvkDTRMSLLibraryDiskCacheShouldDumpSource(const MVKDTRMSLLibraryCach
 static NSString* mvkDTRMSLLibraryDiskCacheBaseName(const MVKDTRMSLLibraryCacheKey& key) {
 	char name[256];
 	snprintf(name, sizeof(name), "msl-v1-d%016llx-n%016zx-h%016zx-s%zx-m%016zx-c%zx-f%08x-i%u",
-			 (unsigned long long)key.deviceRegistryID,
+			 // MTLDevice.registryID changes on every boot, so it must not be part of
+			 // the on-disk name or the persistent cache misses after each restart.
+			 // The device name hash below still separates different GPUs.
+			 0ULL,
 			 key.deviceNameHash,
 			 key.mslHash,
 			 key.mslSize,
